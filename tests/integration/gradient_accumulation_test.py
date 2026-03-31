@@ -28,7 +28,7 @@ import os.path
 from maxtext.common.gcloud_stub import is_decoupled
 from maxtext.trainers.pre_train.train import main as train_main
 from maxtext.utils.globals import MAXTEXT_ASSETS_ROOT
-from maxtext.trainers.post_train.sft.train_sft_deprecated import main as sft_main
+from maxtext.trainers.post_train.sft.train_sft import main as sft_main
 
 from tests.utils.test_helpers import get_test_config_path, get_test_dataset_path, get_test_base_output_directory
 
@@ -164,6 +164,5 @@ class GradientAccumulationTest(unittest.TestCase):
             rf"tokenizer_path={os.path.join(MAXTEXT_ASSETS_ROOT, 'tokenizers', 'tokenizer.llama2')}",
             "steps=3",
             "gradient_accumulation_steps=2",
-            "use_sft=True",
         ]
     )

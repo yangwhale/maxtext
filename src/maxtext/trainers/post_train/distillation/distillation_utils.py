@@ -557,7 +557,13 @@ class MaxTextCheckpointManager(tunix_checkpoint_manager.CheckpointManager):
         )
     }
 
-    if optimizer is not None:
+    # Only restore optimizer state if it was actually saved in this checkpoint.
+    # PeftTrainer.save() doesn't pass the optimizer, so older checkpoints may
+    # only contain model_params.
+    ckpt_optimizer_path = self._checkpoint_manager.directory / str(step) / "optimizer_state"
+    checkpoint_has_optimizer = optimizer is not None and ckpt_optimizer_path.exists()
+
+    if checkpoint_has_optimizer:
       optimizer_state = nnx.state(optimizer, nnx.optimizer.OptState)
       opt_restore_args = jax.tree.map(map_to_pspec, optimizer_state)
       cp_restore_args["optimizer_state"] = checkpoint.args.PyTreeRestore(
@@ -571,7 +577,7 @@ class MaxTextCheckpointManager(tunix_checkpoint_manager.CheckpointManager):
     )
 
     nnx.update(target_model, restored.model_params)
-    if optimizer is not None:
+    if checkpoint_has_optimizer:
       nnx.update(optimizer, restored.optimizer_state)
 
     metadata = self._checkpoint_manager.metadata(step)
