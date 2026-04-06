@@ -142,6 +142,10 @@ def get_dataset(
     )
 
   template_config = load_template_from_file(tmvp_config.chat_template_path)
+  if template_config is None:
+    max_logging.warning(
+        f"Failed to load chat template from {tmvp_config.chat_template_path}. Proceeding without chat template."
+    )
 
   loaded_dataset = (
       grain.MapDataset.source(data)
@@ -339,6 +343,10 @@ def prepare_datasets(trainer_config, model_tokenizer):
     split_name = trainer_config.train_split if trainer_config.train_split != "train" else "train_1M"
     splits = prepare_openinstructmath2_dataset(split=split_name)
     template_config = load_template_from_file(trainer_config.chat_template_path)
+    if template_config is None:
+      max_logging.warning(
+          f"Failed to load chat template from {trainer_config.chat_template_path}. Proceeding without chat template."
+      )
 
     train_dataset = (
         grain.MapDataset.source(splits["train"])
@@ -616,6 +624,10 @@ def create_rl_components(
     )
     # Instantiate the custom MaxText chat parser
     template_config = load_template_from_file(trainer_config.chat_template_path)
+    if template_config is None:
+      max_logging.warning(
+          f"Failed to load chat template from {trainer_config.chat_template_path}. Proceeding without chat template."
+      )
     chat_parser = utils_rl.MaxTextChatParser(
         model_tokenizer=model_tokenizer, template_config=template_config, tmvp_config=trainer_config
     )
