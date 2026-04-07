@@ -28,7 +28,6 @@ import os.path
 from maxtext.common.gcloud_stub import is_decoupled
 from maxtext.trainers.pre_train.train import main as train_main
 from maxtext.utils.globals import MAXTEXT_ASSETS_ROOT
-from maxtext.trainers.post_train.sft.train_sft import main as sft_main
 
 from tests.utils.test_helpers import get_test_config_path, get_test_dataset_path, get_test_base_output_directory
 
@@ -150,6 +149,9 @@ class GradientAccumulationTest(unittest.TestCase):
   @pytest.mark.integration_test
   @pytest.mark.tpu_only
   def test_sft_grad_accumulate_same_loss(self):
+    pytest.importorskip("tunix")
+    from maxtext.trainers.post_train.sft.train_sft import main as sft_main  # pylint: disable=import-outside-toplevel
+
     sft_main(
         [
             None,
