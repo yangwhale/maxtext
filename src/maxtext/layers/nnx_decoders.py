@@ -981,9 +981,10 @@ class NNXDecoder(nnx.Module):
               **common_kwargs,
           )
         else:
-          y, self.dense_layers = self._apply_layers_sequentially(
+          y, _updated_dense = self._apply_layers_sequentially(
               self.dense_layers, y, *layer_args, length=cfg.first_num_dense_layers, **layer_kwargs
           )
+          nnx.update(self.dense_layers, nnx.state(_updated_dense))
 
           num_moe = cfg.num_decoder_layers - cfg.first_num_dense_layers
 
@@ -1004,9 +1005,10 @@ class NNXDecoder(nnx.Module):
                 policy=policy,
             )
           else:
-            y, self.moe_layers = self._apply_layers_sequentially(
+            y, _updated_moe = self._apply_layers_sequentially(
                 self.moe_layers, y, *layer_args, length=num_moe, **layer_kwargs
             )
+            nnx.update(self.moe_layers, nnx.state(_updated_moe))
       elif self.is_gemma3:
         y = self._apply_gemma3_scanned_blocks(
             y,
@@ -1021,7 +1023,10 @@ class NNXDecoder(nnx.Module):
         )
       else:
         scan_length = int(cfg.num_decoder_layers / cfg.inhomogeneous_layer_cycle_interval)
-        y, self.layers = self._apply_layers_sequentially(self.layers, y, *layer_args, length=scan_length, **layer_kwargs)
+        y, _updated_layers = self._apply_layers_sequentially(
+            self.layers, y, *layer_args, length=scan_length, **layer_kwargs
+        )
+        nnx.update(self.layers, nnx.state(_updated_layers))
     else:
       prevent_cse = maxtext_utils.should_prevent_cse_in_remat(cfg)
 
@@ -1105,7 +1110,10 @@ class NNXDecoder(nnx.Module):
 
     # Apply the main scan over the full blocks
     if scan_length > 0:
-      y, self.layers = self._apply_layers_sequentially(self.layers, y, *layer_args, length=scan_length, **layer_kwargs)
+      y, _updated_layers = self._apply_layers_sequentially(
+          self.layers, y, *layer_args, length=scan_length, **layer_kwargs
+      )
+      nnx.update(self.layers, nnx.state(_updated_layers))
 
     # Apply any remaining layers that did not fit into a full scanned block
     num_remaining_layers = cfg.num_decoder_layers % attention_pattern_length

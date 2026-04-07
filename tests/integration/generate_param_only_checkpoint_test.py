@@ -54,6 +54,9 @@ def run_e2e_test_flow(hardware, model_config, attention_type="autoselected", sta
       f"attention={attention_type}",
       "max_target_length=128",
       "per_device_batch_size=1",
+      "pure_nnx=False",
+      "enable_nnx=False",
+      "pure_nnx_decoder=False",
   ] + model_config
 
   pathways_command = []

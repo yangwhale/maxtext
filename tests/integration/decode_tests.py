@@ -36,6 +36,8 @@ class DecodeTests(unittest.TestCase):
   _base_output_directory = get_test_base_output_directory()
 
   GEMMA_2B_CKPT_PATH = "gs://maxtext-gemma/2b/2025-11-04-04-33//0/items"
+  # Decode/inference uses maxengine which does not yet support NNX; use Linen.
+  _LINEN_FLAGS = ["pure_nnx=False", "enable_nnx=False", "pure_nnx_decoder=False"]
   CONFIGS = {
       "base": [  # tests decode
           None,
@@ -49,7 +51,8 @@ class DecodeTests(unittest.TestCase):
           "max_target_length=128",
           "per_device_batch_size=1",
           rf"tokenizer_path={os.path.join(MAXTEXT_ASSETS_ROOT, 'tokenizers', 'tokenizer.llama2')}",
-      ],
+      ]
+      + _LINEN_FLAGS,
       "int8": [  # tests decode with int8 quantization
           None,
           get_test_config_path(),
@@ -64,7 +67,8 @@ class DecodeTests(unittest.TestCase):
           "quantization=int8",
           "quantize_kvcache=True",
           rf"tokenizer_path={os.path.join(MAXTEXT_ASSETS_ROOT, 'tokenizers', 'tokenizer.llama2')}",
-      ],
+      ]
+      + _LINEN_FLAGS,
       "pdb_lt_1": [  # tests decode with per_device_batch_size < 1
           None,
           get_test_config_path(),
@@ -77,7 +81,8 @@ class DecodeTests(unittest.TestCase):
           "max_target_length=128",
           "per_device_batch_size=.25",
           rf"tokenizer_path={os.path.join(MAXTEXT_ASSETS_ROOT, 'tokenizers', 'tokenizer.llama2')}",
-      ],
+      ]
+      + _LINEN_FLAGS,
       "decode_sampling": [
           None,
           get_test_config_path(),
@@ -95,7 +100,8 @@ class DecodeTests(unittest.TestCase):
           "attention=dot_product",
           "prompt=I love to",
           "skip_jax_distributed_system=True",
-      ],
+      ]
+      + _LINEN_FLAGS,
   }
   SAMPLING_STRATEGY_CONFIG = {
       "greedy": [

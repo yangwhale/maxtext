@@ -53,6 +53,9 @@ class Inference_Microbenchmark(unittest.TestCase):
             "weight_dtype=bfloat16",
             "attention=dot_product",
             "skip_jax_distributed_system=True",
+            "pure_nnx=False",
+            "enable_nnx=False",
+            "pure_nnx_decoder=False",
         ]
     )
     run_benchmarks(config)

@@ -192,6 +192,8 @@ def get_model_mdn(model_name, scan_layers=True, verbose=False, pure_nnx=True):
     model = models.transformer_as_linen(config, mesh=mesh, quant=quant)
   # Get dimension number
   muon_weight_dimension_numbers = get_muon_weight_dimension_numbers(model, config, verbose=verbose)
+  if pure_nnx:
+    muon_weight_dimension_numbers = {"params": nnx.to_pure_dict(muon_weight_dimension_numbers)}
   return muon_weight_dimension_numbers
 
 
