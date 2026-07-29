@@ -171,7 +171,10 @@ class LayerwiseQuantization:
     # `DeepSeek*ToLinen` wrappers. The NNX path runs whole-model convert
     # forward and is model-agnostic — see `_load_and_quantize_nnx`.
     if not config.pure_nnx:
-      assert config.decoder_block == common_types.DecoderBlockType.DEEPSEEK, (
+      assert config.decoder_block in (
+      common_types.DecoderBlockType.DEEPSEEK,
+      common_types.DecoderBlockType.HUNYUAN3,
+  ), (
           f"Linen layerwise quantization only supports {common_types.DecoderBlockType.DEEPSEEK}, "
           f"got {config.decoder_block}."
       )

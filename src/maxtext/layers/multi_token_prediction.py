@@ -191,7 +191,10 @@ class MultiTokenPredictionLayer(nnx.Module):
     concatenated_features = jnp.concatenate([embedding_norm, hidden_state_norm], axis=-1)
     projected_features = self.projection_layer(concatenated_features)
 
-    if self.config.decoder_block == DecoderBlockType.DEEPSEEK and self.config.use_batch_split_schedule:
+    if (
+          self.config.decoder_block in (DecoderBlockType.DEEPSEEK, DecoderBlockType.HUNYUAN3)
+          and self.config.use_batch_split_schedule
+      ):
 
       def extract_fn(x):
         if isinstance(x, nnx.variablelib.Variable):
