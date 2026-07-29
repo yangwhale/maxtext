@@ -75,6 +75,14 @@ from maxtext.utils.vocabulary_tiling import vocab_tiling_linen_loss, vocab_tilin
 VertexTensorboardManager, _vertex_tb_is_stub = vertex_tensorboard_modules()
 
 
+_MOE_BLOCK_ATTR = {"deepseek": "DeepSeekMoeBlock_0", "hunyuan3": "Hunyuan3MoeBlock_0"}
+
+
+def _moe_block_attr(config):
+  key = getattr(config.decoder_block, "value", config.decoder_block)
+  return _MOE_BLOCK_ATTR[str(key)]
+
+
 def get_first_step(model, state):
   if isinstance(model, nn.Module):
     return int(state.step)
@@ -507,7 +515,7 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
 
     # Apply updates for Auxiliary-Loss-Free load balancing for DeepSeek family
     if config.routed_bias and config.routed_bias_update_rate > 0.0 and moe_bias_updates is not None:
-      target_path = ("params", "decoder", "moe_layers", "DeepSeekMoeBlock_0", "MoeBlock_0", "gate", "bias")
+      target_path = ("params", "decoder", "moe_layers", _moe_block_attr(config), "MoeBlock_0", "gate", "bias")
       # Updates the shape to be aligned with state.
       moe_bias_updates = jnp.array(moe_bias_updates[0]).transpose()
       new_state = maxtext_utils.update_state_param(new_state, target_path, moe_bias_updates)
@@ -539,7 +547,7 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
 
     # Apply updates for Auxiliary-Loss-Free load balancing for DeepSeek family
     if config.routed_bias and config.routed_bias_update_rate > 0.0 and moe_bias_updates is not None:
-      target_bias = new_state.model.decoder.moe_layers.DeepSeekMoeBlock_0.MoeBlock_0.gate.bias
+      target_bias = getattr(new_state.model.decoder.moe_layers, _moe_block_attr(config)).MoeBlock_0.gate.bias
       target_bias.value = target_bias.value + jnp.array(moe_bias_updates[0]).transpose()
 
   lm_loss = xent_sum / (total_weights + EPS)
