@@ -49,6 +49,7 @@ from maxtext.layers.quantizations import AqtQuantization as Quant
 from maxtext.models import (
     deepseek,
     deepseek4,
+    hunyuan3,
     deepseek_batchsplit,
     deepseek_batchsplit_fp8,
     envy,
@@ -169,6 +170,55 @@ def hoist_fsdp_weight_gather(params, mesh, config):
     return x.replace(checkpoint_name(pinned, _GATHERED_FSDP_WEIGHT))
 
   return jax.tree.map(hoist_auto, params, is_leaf=lambda x: isinstance(x, nnx.Variable))
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(3,))
+def _dh_gauge_correction(y, kernel_mean, logits, scale):
+  """Zero in the forward pass. Backward: adds (scale - 1) * s_t * kernel_mean to the gradient of y, where s_t is the
+  row sum (over the vocab axis) of the logits cotangent as it enters the output projection. See
+  `lm_head_dh_gauge_scale`."""
+  del y, kernel_mean
+  return jnp.zeros_like(logits)
+
+
+def _dh_gauge_correction_fwd(y, kernel_mean, logits, scale):
+  del scale
+  return jnp.zeros_like(logits), (y, kernel_mean)
+
+
+def _dh_gauge_correction_bwd(scale, res, g):
+  y, kernel_mean = res
+  # The barrier keeps XLA (excess precision) from folding a bf16 -> f32 round trip back to the f32 cotangent:
+  # s must be the row sum of the values the output projection's backward actually consumes.
+  s = jnp.sum(jax.lax.optimization_barrier(g).astype(jnp.float32), axis=-1, keepdims=True)
+  dy = ((scale - 1.0) * s * kernel_mean).astype(y.dtype)
+  return dy, jnp.zeros_like(kernel_mean), jnp.zeros_like(g)
+
+
+_dh_gauge_correction.defvjp(_dh_gauge_correction_fwd, _dh_gauge_correction_bwd)
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(2,))
+def _dh_remove_direction(y, u, alpha):
+  """Identity in the forward pass. Backward: g - alpha * (g . u) u along the last axis (u is a unit vector).
+  See `lm_head_dh_wbar_remove`."""
+  del u
+  return y
+
+
+def _dh_remove_direction_fwd(y, u, alpha):
+  del alpha
+  return y, (u,)
+
+
+def _dh_remove_direction_bwd(alpha, res, g):
+  (u,) = res
+  gf = g.astype(jnp.float32)
+  c = jnp.sum(gf * u, axis=-1, keepdims=True)
+  return (gf - alpha * c * u).astype(g.dtype), jnp.zeros_like(u)
+
+
+_dh_remove_direction.defvjp(_dh_remove_direction_fwd, _dh_remove_direction_bwd)
 
 
 class NNXDecoderLayer(nnx.Module):
@@ -571,11 +621,12 @@ class NNXDecoder(nnx.Module):
           parameter_memory_host_offload=config.parameter_memory_host_offload,
           weight_quant=quantizations.get_weight_quant_config(config, "logits_dense"),
           weight_grad_in_kernel_order=config.lm_head_weight_grad_in_kernel_order,
+          kernel_grad_fp32=getattr(config, "logits_dense_wgrad_fp32", False),
           rngs=rngs,
       )
 
     self.scanned_layers = None
-    self.is_deepseek = self.config.decoder_block == DecoderBlockType.DEEPSEEK
+    self.is_deepseek = self.config.decoder_block in (DecoderBlockType.DEEPSEEK, DecoderBlockType.HUNYUAN3)
     self.is_deepseek4 = self.config.decoder_block == DecoderBlockType.DEEPSEEK4
     self.is_gemma3 = self.config.decoder_block == DecoderBlockType.GEMMA3
     self.is_gemma4 = self.config.decoder_block == DecoderBlockType.GEMMA4
@@ -1348,6 +1399,7 @@ class NNXDecoder(nnx.Module):
         DecoderBlockType.SIMPLE: [simple_layer.SimpleDecoderLayer],
         DecoderBlockType.SIMPLE_MLP: [simple_layer.SimpleMlpDecoderLayer],
         DecoderBlockType.DEEPSEEK: get_deepseek(),
+        DecoderBlockType.HUNYUAN3: [hunyuan3.Hunyuan3DenseLayer, hunyuan3.Hunyuan3MoELayer],
         DecoderBlockType.DEEPSEEK4: get_scannable(deepseek4.DeepSeek4DecoderLayer, deepseek4.DeepSeek4ScannableBlock),
         DecoderBlockType.GPT_OSS: get_scannable(gpt_oss.GptOssDecoderLayer, gpt_oss.GptOssScannableBlock),
         DecoderBlockType.QWEN3_NEXT: get_scannable(qwen3.Qwen3NextDecoderLayer, qwen3.Qwen3NextScannableBlock),
@@ -1489,6 +1541,10 @@ class NNXDecoder(nnx.Module):
         )
       elif remat_policy == "save_out_proj":
         policy = jax.checkpoint_policies.save_only_these_names("out_proj")
+      elif remat_policy == "save_everything":
+        # Save every intermediate of the forward pass for the backward pass: numerically the same as no remat
+        # (the backward never recomputes a forward op), at the highest HBM cost. Useful as a numerics reference.
+        policy = jax.checkpoint_policies.everything_saveable
       else:
         assert remat_policy == "full", "Remat policy needs to be on list of remat policies"
         policy = None
@@ -1503,6 +1559,7 @@ class NNXDecoder(nnx.Module):
         DecoderBlockType.MIXTRAL,
         DecoderBlockType.DEEPSEEK,
         DecoderBlockType.DEEPSEEK4,
+        DecoderBlockType.HUNYUAN3,
         DecoderBlockType.GEMMA,
         DecoderBlockType.GEMMA2,
         DecoderBlockType.GEMMA3,
@@ -1523,6 +1580,8 @@ class NNXDecoder(nnx.Module):
           RMSNorm,
           num_features=num_features,
           shard_mode=self.config.shard_mode,
+          single_rounding=getattr(self.config, "rmsnorm_single_rounding", False),
+          scale_grad_fp32=getattr(self.config, "rmsnorm_scale_grad_fp32", False),
           rngs=rngs,
       )
     elif self.config.decoder_block == DecoderBlockType.GPT3:
@@ -1763,7 +1822,13 @@ class NNXDecoder(nnx.Module):
         y = sharding.maybe_shard_with_logical(
             y, head_in_axes, self.mesh, cfg.shard_mode, debug_sharding=cfg.debug_sharding
         )
+      if cfg.lm_head_dh_wbar_remove != 0.0:
+        kmean = jnp.mean(jnp.asarray(self.logits_dense.kernel[...], jnp.float32), axis=-1)
+        y = _dh_remove_direction(y, jax.lax.stop_gradient(kmean / jnp.linalg.norm(kmean)), cfg.lm_head_dh_wbar_remove)
       logits = self.logits_dense(y, out_sharding=out_sharding)
+      if cfg.lm_head_dh_gauge_scale != 1.0:
+        kernel_mean = jnp.mean(jnp.asarray(self.logits_dense.kernel[...], jnp.float32), axis=-1)
+        logits = logits + _dh_gauge_correction(y, jax.lax.stop_gradient(kernel_mean), logits, cfg.lm_head_dh_gauge_scale)
 
     if self.config.cast_logits_to_fp32:
       logits = logits.astype(jnp.float32)

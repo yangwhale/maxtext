@@ -145,6 +145,7 @@ class RematPolicy(str, Enum):
   CUSTOM = "custom"
   MINIMAL_OFFLOADED = "minimal_offloaded"
   SAVE_OUT_PROJ = "save_out_proj"
+  SAVE_EVERYTHING = "save_everything"
 
 
 class RematLocation(str, Enum):
@@ -254,6 +255,8 @@ ModelName = Literal[
     "deepseek3.2-671b",
     "deepseek4-tiny",
     "deepseek4-284b",
+    "hunyuan3-295b",
+    "hunyuan3-smoke",
     "deepseek-custom",
     "kimi-k2-1t",
     "gemma-7b",
@@ -510,6 +513,73 @@ class DataTypes(BaseModel):
   activations_in_float32: bool = Field(
       False,
       description="If True, sets activations to float32 before the nonlinearity.",
+  )
+  lm_head_dh_wbar_remove: float = Field(
+      0.0,
+      description=(
+          "Diagnostic. Let u be the unit vector along the vocab-axis mean of the untied output kernel (the direction"
+          " that moves all logits together). The gradient arriving at the final hidden state from the output head"
+          " becomes dh - alpha * (dh . u) u. 0 (default) leaves the program unchanged."
+      ),
+  )
+  lm_head_dh_gauge_scale: float = Field(
+      1.0,
+      description=(
+          "Diagnostic. The gradient that flows from the logits back into the final hidden state contains s_t * w_bar,"
+          " where s_t is the row sum of the logits cotangent (zero in exact arithmetic, nonzero after rounding) and"
+          " w_bar is the vocab-axis mean of the untied output kernel. The hidden-state gradient becomes"
+          " dh + (scale - 1) * s_t * w_bar: 0 removes the part, 1 (default) leaves the program unchanged."
+          " The output-kernel gradient is not touched."
+      ),
+  )
+  rmsnorm_single_rounding: bool = Field(
+      False,
+      description=(
+          "If True, RMSNorm computes x * rsqrt(mean(x^2) + eps) * scale in float32 and rounds to `dtype` once"
+          " (as fused GPU RMSNorm kernels do). If False, the normalized value is rounded to `dtype` before the"
+          " multiply by the `dtype` scale, i.e. two roundings."
+      ),
+  )
+  dense_fp32_accumulation: bool = Field(
+      False,
+      description=(
+          "If True, DenseGeneral (attention q/k/v/out projections, dense MLP) runs its dot_general with"
+          " preferred_element_type=float32 and rounds to `dtype` once. When the contracted axis is fsdp-sharded,"
+          " XLA may lower the dot to a windowed (collective) matmul that otherwise accumulates per-shard partial"
+          " products in `dtype`."
+      ),
+  )
+  rmsnorm_scale_grad_fp32: bool = Field(
+      False,
+      description=(
+          "If True (only with rmsnorm_single_rounding), RMSNorm rounds its scale to `dtype` with a straight-through"
+          " gradient: the forward pass is unchanged, and the scale gradient (a sum over all tokens) stays float32."
+          " Without it, JAX transposes reduce_precision as a linear op and rounds the scale gradient to `dtype`."
+      ),
+  )
+  logits_dense_wgrad_fp32: bool = Field(
+      False,
+      description=(
+          "If True, the output head (logits_dense) feeds its float32 kernel, rounded to `dtype` values with a"
+          " straight-through gradient, into a float32-accumulating dot and rounds the logits to `dtype` once. The"
+          " forward pass is unchanged and the kernel gradient (wgrad) stays float32 instead of being produced in"
+          " `dtype` (the all-gather of the kernel then moves float32 bytes)."
+      ),
+  )
+  embedding_grad_fp32: bool = Field(
+      False,
+      description=(
+          "If True, the token embedding gathers rows from the float32 table and casts them to `dtype` (bitwise the"
+          " same as casting the table first), so the backward scatter-add accumulates in float32 instead of `dtype`."
+      ),
+  )
+  mlp_activation_round_per_op: bool = Field(
+      False,
+      description=(
+          "If True, the gated MLP activation (dense MLP, shared and routed experts) computes each op in float32"
+          " and rounds its output to `dtype`: dtype(dtype(act(float32(gate))) * up). This is what an eager framework"
+          " computes on `dtype` tensors. Takes precedence over activations_in_float32 for the activation."
+      ),
   )
   dtype_mm: str = Field("float32", description="Data type for multimodal model's vision encoder")
 
@@ -1527,6 +1597,15 @@ class MoEGeneral(BaseModel):
           " does not control quantization -- see `quantize_router_proj`, which governs whether the gate"
           " projection matmul is quantized. Setting both is rejected at config init, because quantizing the"
           " projection discards the fp32 operand precision."
+      ),
+  )
+  routed_gate_bf16_rounding: bool = Field(
+      False,
+      description=(
+          "Round the MoE router (GateLogit) kernel to bfloat16 (round-to-nearest-even) and back before the"
+          " router matmul. With float32_gate_logits=True this makes the router matmul operands exactly the"
+          " bf16 weight x bf16 activation of a mixed-precision GPU router (FP32 accumulate and output), without"
+          " depending on how the backend rounds FP32 operands at matmul_precision."
       ),
   )
   prefuse_moe_weights: bool = Field(
@@ -5045,7 +5124,7 @@ class MaxTextConfig(
       self.tensors_to_offload = [t for t in tensors if getattr(self, t) == "offload"]
 
     if self.pipeline_parallel_layers == -1:
-      if self.decoder_block == DecoderBlockType.DEEPSEEK:
+      if self.decoder_block in (DecoderBlockType.DEEPSEEK, DecoderBlockType.HUNYUAN3):
         moe_layers = self.num_decoder_layers - self.first_num_dense_layers
         self.pipeline_parallel_layers = moe_layers
       else:
@@ -5521,7 +5600,7 @@ class MaxTextConfig(
       if (
           self.routed_bias
           and self.routed_bias_update_rate > 0.0
-          and self.decoder_block not in (DecoderBlockType.DEEPSEEK, DecoderBlockType.DEEPSEEK4)
+          and self.decoder_block not in (DecoderBlockType.DEEPSEEK, DecoderBlockType.DEEPSEEK4, DecoderBlockType.HUNYUAN3)
       ):
         raise ValueError("Loss-free load balancing is only supported for the DeepSeek decoder block.")
       if self.te_moe_block and not self.sparse_matmul:
@@ -5982,6 +6061,7 @@ class MaxTextConfig(
 
     if self.opt_type == "muon" and self.decoder_block not in [
         DecoderBlockType.DEEPSEEK,
+        DecoderBlockType.HUNYUAN3,
         DecoderBlockType.DEEPSEEK4,
         DecoderBlockType.QWEN3,
         DecoderBlockType.QWEN3_MOE,

@@ -1990,6 +1990,8 @@ class AttentionWithNorm(nnx.Module):
         shard_mode=config.shard_mode,
         kernel_axes=("norm",),
         epsilon=config.normalization_layer_epsilon,
+        single_rounding=config.rmsnorm_single_rounding,
+        scale_grad_fp32=getattr(config, "rmsnorm_scale_grad_fp32", False),
         rngs=rngs,
     )
 
@@ -2031,6 +2033,8 @@ class AttentionWithNorm(nnx.Module):
         shard_mode=config.shard_mode,
         kernel_axes=("norm",),
         epsilon=config.normalization_layer_epsilon,
+        single_rounding=config.rmsnorm_single_rounding,
+        scale_grad_fp32=getattr(config, "rmsnorm_scale_grad_fp32", False),
         rngs=rngs,
     )
 

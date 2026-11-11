@@ -120,10 +120,11 @@ class Embed(nnx.Module):
     if not jnp.issubdtype(inputs.dtype, jnp.integer):
       raise ValueError("Input type must be an integer or unsigned integer.")
 
-    embedding = jnp.asarray(
-        _maybe_move_embedding_to_device(self.embedding.get_value(), self.config),
-        self.dtype,
-    )
+    grad_fp32 = getattr(cfg, "embedding_grad_fp32", False) and not cfg.use_iota_embed
+    table = _maybe_move_embedding_to_device(self.embedding.get_value(), self.config)
+    # embedding_grad_fp32: gather from the float32 table and cast the rows (bitwise the same as casting the table
+    # first), so the backward scatter-add accumulates in float32 instead of `dtype`.
+    embedding = table if grad_fp32 else jnp.asarray(table, self.dtype)
 
     output_axis_names = (
         (
@@ -150,6 +151,8 @@ class Embed(nnx.Module):
       output = jnp.dot(one_hot, embedding, out_sharding=out_sharding)
     else:
       output = embedding.at[inputs].get(out_sharding=out_sharding)
+      if grad_fp32:
+        output = jnp.asarray(output, self.dtype)
 
     return output
 

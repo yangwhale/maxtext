@@ -141,6 +141,14 @@ constant_bound_config: ""
 # https://kolonist26-jax-kr.readthedocs.io/en/latest/jax.lax.html#jax.lax.precision
 matmul_precision: "default"
 activations_in_float32: false # sets activations to float32 before nonlinearity it true, else dtype
+lm_head_dh_wbar_remove: 0.0 # diagnostic: remove this fraction of the hidden-state gradient's component along the output kernel's vocab-mean direction
+lm_head_dh_gauge_scale: 1.0 # diagnostic: scale the row-sum (softmax gauge) part of the gradient flowing from logits back into the hidden state; 1.0 = unchanged
+rmsnorm_single_rounding: false # RMSNorm: compute normalize*scale in float32 and round to dtype once (else round twice)
+mlp_activation_round_per_op: false # gated MLP: each op in float32, output rounded to dtype (act, then act*up)
+dense_fp32_accumulation: false # DenseGeneral (attention q/k/v/out, dense MLP): float32 accumulation, round to dtype once (a windowed collective matmul otherwise adds per-shard partials in bf16)
+rmsnorm_scale_grad_fp32: false # RMSNorm (with rmsnorm_single_rounding): the scale's rounding to dtype is straight-through in the backward pass, so its gradient stays float32 (else rounded to dtype)
+logits_dense_wgrad_fp32: false # output head (logits_dense): kernel enters the dot as dtype-rounded float32, so its gradient (wgrad) stays float32 (else produced in dtype); forward unchanged
+embedding_grad_fp32: false # token embedding: gather rows from the float32 table, then cast to dtype, so the scatter-add gradient accumulates in float32 (else in dtype); forward unchanged
 # used to replicate the quantization scale to avoid the inefficient xla fusion for 2d sharding.
 replicate_quant_scale: false
 # path to file with quantization config for intmp.
@@ -257,6 +265,9 @@ float32_weight_sum: true
 # compute dtype only (the kernel is still stored in weight_dtype): casts the gate inputs and kernel, emits fp32 logits, and applies to the routed bias add and score function.
 # see quantize_router_proj for whether the gate projection matmul is quantized; enabling both is rejected.
 float32_gate_logits: false
+# routed_gate_bf16_rounding - round the router (GateLogit) kernel to bf16 (RNE) and back before the router matmul,
+# so that with float32_gate_logits the operands are exactly bf16 weight x bf16 activation (as a mixed-precision GPU router).
+routed_gate_bf16_rounding: false
 # multi-token prediction configs
 # the number of auxiliary prediction layers to use for mtp.
 # set to 0 to disable the feature.
@@ -498,7 +509,8 @@ set_remat_policy_on_layers_per_stage: false
 
 
 # Choose 'remat_policy' between 'minimal_with_context', 'minimal', 'save_dot_with_context_except_mlp', 'save_dot_except_mlpwi', 'save_dot_except_mlp',
-# 'save_qkv_proj', 'qkv_proj_offloaded', 'custom', 'minimal_offloaded', 'save_out_proj' and 'full'.
+# 'save_qkv_proj', 'qkv_proj_offloaded', 'custom', 'minimal_offloaded', 'save_out_proj', 'save_everything' and 'full'.
+# 'save_everything' keeps every forward intermediate for the backward (no recomputation at all, highest HBM).
 # These options offer a trade-off between speed (fastest to slowest) and HBM usage (highest to lowest)
 remat_policy: 'full'
 # If "custom" remat_policy is chosen, you can select tensors from the following list to offload on host memory, rematerialize or save on device memory.

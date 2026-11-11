@@ -93,6 +93,30 @@ def parse_libtpu_flags_to_dict(flags_str: str) -> dict:
   return options_dict
 
 
+@partial(jax.custom_vjp, nondiff_argnums=(1,))
+def round_to_dtype_straight_through(x, dtype):
+  """Rounds float32 `x` to the values of `dtype` (result stays float32) with a straight-through gradient.
+
+  `jax.lax.reduce_precision` alone is transposed as a linear op, so the cotangent is rounded the same way; a
+  gradient that is a long sum (e.g. over all tokens) would then be rounded to `dtype` before reaching the float32
+  parameter. Here the forward value is the same reduce_precision, and the gradient passes through unchanged.
+  """
+  fi = jnp.finfo(dtype)
+  return jax.lax.reduce_precision(x, fi.nexp, fi.nmant)
+
+
+def _round_to_dtype_fwd(x, dtype):
+  return round_to_dtype_straight_through(x, dtype), None
+
+
+def _round_to_dtype_bwd(dtype, _, g):
+  del dtype
+  return (g,)
+
+
+round_to_dtype_straight_through.defvjp(_round_to_dtype_fwd, _round_to_dtype_bwd)
+
+
 def with_memory_kind(t, memory_kind):
   return jax.tree_util.tree_map(lambda x: x.with_memory_kind(kind=memory_kind), t)
 

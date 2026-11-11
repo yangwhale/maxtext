@@ -72,9 +72,20 @@ class RMSNorm(nnx.Module):
       parameter_memory_host_offload: bool = False,
       scale_offset: float = 0.0,
       with_scale: bool = True,
+      single_rounding: bool = False,
+      scale_grad_fp32: bool = False,
       *,
       rngs: nnx.Rngs,
   ):
+    # single_rounding: compute x * rsqrt(mean(x^2) + eps) * scale entirely in float32 and round to `dtype`
+    # once at the end (as fused GPU RMSNorm kernels do), instead of rounding the normalized value to `dtype`
+    # first and then multiplying by the `dtype` scale (two roundings). The scale is still rounded to `dtype`
+    # before the multiply, matching a GPU model whose parameters are kept in `dtype`.
+    self.single_rounding = single_rounding
+    # scale_grad_fp32 (single_rounding only): round the scale to `dtype` with a straight-through gradient, so the
+    # scale gradient (a sum over all tokens) stays float32 instead of being rounded to `dtype` by the transpose of
+    # reduce_precision. The forward value is unchanged.
+    self.scale_grad_fp32 = scale_grad_fp32
     self.num_features = num_features
     self.epsilon = epsilon
     self.dtype = dtype
@@ -97,6 +108,25 @@ class RMSNorm(nnx.Module):
     """Applies layer normalization on the input."""
     x = jnp.asarray(x, jnp.float32)
     mean2 = jnp.mean(lax.square(x), axis=-1, keepdims=True)
+    if self.single_rounding and self.with_scale and self.scale_offset == 0.0:
+      normed_fp32 = x * lax.rsqrt(mean2 + self.epsilon)
+      scale = self.scale.get_value()
+      if self.parameter_memory_host_offload:
+        scale = jax.device_put(scale, max_utils.device_space())
+      # Round the scale to `dtype` (as the GPU's `dtype` parameter) with reduce_precision: a convert round trip
+      # may be optimized away under excess precision, reduce_precision never is.
+      if self.scale_grad_fp32:
+        scale_fp32 = max_utils.round_to_dtype_straight_through(jnp.asarray(scale, jnp.float32), self.dtype)
+      else:
+        fi = jnp.finfo(self.dtype)
+        scale_fp32 = lax.reduce_precision(jnp.asarray(scale, jnp.float32), fi.nexp, fi.nmant)
+      if self.shard_mode == ShardMode.EXPLICIT:
+        scale_fp32 = align_scale_with_normalized_axis(scale_fp32, normed_fp32)
+      sharding = truncate_out_sharding(out_sharding, normed_fp32.ndim) if (
+          self.shard_mode == ShardMode.EXPLICIT and out_sharding is not None) else None
+      y = jnp.einsum("...k,k->...k", normed_fp32, scale_fp32, out_sharding=sharding)
+      return jnp.asarray(y, self.dtype)
+
     y = jnp.asarray(x * lax.rsqrt(mean2 + self.epsilon), self.dtype)
 
     # out_sharding must be None in auto shard mode

@@ -161,6 +161,7 @@ def _compute_dot_general_nnx(
     scale_block_size: int | tuple[int, ...] | None = None,
     act_calibration_method: str = "absmax",
     weight_grad_in_kernel_order: bool = False,
+    fp32_accumulation: bool = False,
 ):
   """Computes a dot_general operation that may be quantized."""
   dot_general = lax.dot_general
@@ -211,6 +212,19 @@ def _compute_dot_general_nnx(
   if weight_grad_in_kernel_order:
     return _dot_general_in_auto_axes(inputs, kernel, ((axis, contract_ind), ((), ())), matmul_precision, out_sharding)
 
+  if fp32_accumulation:
+    # Accumulate in float32 and round to the compute dtype once. Without this, a contraction over an
+    # fsdp-sharded axis that XLA lowers to a windowed (collective) matmul adds the per-shard partial
+    # products in the output dtype (bf16), i.e. one extra rounding per window step.
+    out = dot_general(
+        inputs,
+        kernel,
+        ((axis, contract_ind), ((), ())),
+        precision=matmul_precision,
+        out_sharding=out_sharding,
+        preferred_element_type=jnp.float32,
+    )
+    return out.astype(compute_dtype)
   return dot_general(
       inputs, kernel, ((axis, contract_ind), ((), ())), precision=matmul_precision, out_sharding=out_sharding
   )
@@ -244,6 +258,8 @@ class DenseGeneral(nnx.Module):
       block_size: int | tuple[int, ...] | None = None,
       weight_quant: quantizations.WeightQuantConfig | None = None,
       weight_grad_in_kernel_order: bool = False,
+      fp32_accumulation: bool = False,
+      kernel_grad_fp32: bool = False,
       *,  # Following arguments are keyword-only
       rngs: nnx.Rngs = None,
   ):
@@ -285,8 +301,16 @@ class DenseGeneral(nnx.Module):
         stored kernel, its initialization and the arithmetic are all untouched,
         so gradients are bit-identical to the default rule. Only takes effect
         under `shard_mode: explicit`; ignored when the layer is quantized.
+      fp32_accumulation: accumulate the dot in float32 (preferred_element_type) and round to `dtype` once.
+        Unquantized path only. See `dense_fp32_accumulation` in base.yml.
+      kernel_grad_fp32: keep the float32 kernel through the dot (rounded to `dtype` values with a straight-through
+        gradient), accumulate in float32 and round to `dtype` once. The forward value is unchanged; the kernel
+        gradient stays float32 instead of being produced in `dtype`. Unquantized path only. See
+        `logits_dense_wgrad_fp32` in base.yml.
       rngs: RNG state for initialization in nnx.
     """
+    self.fp32_accumulation = fp32_accumulation
+    self.kernel_grad_fp32 = kernel_grad_fp32
     if weight_quant is not None:
       weight_dtype = weight_quant.weight_dtype
       scale_dtype = weight_quant.scale_dtype
@@ -514,7 +538,12 @@ class DenseGeneral(nnx.Module):
       # FP8 weights deliberately stay quantized until the fused dequantization in
       # _compute_dot_general_nnx, so that the all-gather moves 8-bit values.
       is_fp8_weight = kernel_scale is not None or is_fp8_dtype(getattr(kernel, "dtype", None))
-      if not is_fp8_weight:
+      kernel_grad_fp32 = self.kernel_grad_fp32 and self.quant is None and not is_fp8_weight
+      if kernel_grad_fp32:
+        # dtype-rounded values held in float32 (straight-through): the kernel gradient stays float32.
+        kernel = max_utils.round_to_dtype_straight_through(jnp.asarray(kernel, jnp.float32), self.dtype)
+        inputs = jnp.asarray(inputs, jnp.float32)  # exact: inputs are already `dtype` values
+      elif not is_fp8_weight:
         kernel = jnp.asarray(kernel, self.dtype)
 
     if slice_bounds is not None:
@@ -564,6 +593,7 @@ class DenseGeneral(nnx.Module):
         scale_block_size=self.block_size,
         act_calibration_method=self.quant.act_calibration_method if native_fp8_compute else "absmax",
         weight_grad_in_kernel_order=weight_grad_in_kernel_order,
+        fp32_accumulation=(self.fp32_accumulation or self.kernel_grad_fp32) and quant_dot_general is None,
     )
 
     if self.bias is not None:
@@ -694,6 +724,7 @@ class MlpBlock(nnx.Module):
           use_bias=self.use_bias,
           shard_mode=self.config.shard_mode,
           weight_grad_in_kernel_order=self.config.dense_weight_grad_in_kernel_order,
+          fp32_accumulation=getattr(self.config, "dense_fp32_accumulation", False),
           matmul_precision=self.config.matmul_precision,
           mesh=self.mesh,
           use_two_stage_all_gather=self.config.dense_fsdp_use_two_stage_all_gather,
@@ -716,6 +747,7 @@ class MlpBlock(nnx.Module):
             use_bias=self.use_bias,
             shard_mode=self.config.shard_mode,
             weight_grad_in_kernel_order=self.config.dense_weight_grad_in_kernel_order,
+            fp32_accumulation=getattr(self.config, "dense_fp32_accumulation", False),
             matmul_precision=self.config.matmul_precision,
             mesh=self.mesh,
             use_two_stage_all_gather=self.config.dense_fsdp_use_two_stage_all_gather,
@@ -737,6 +769,7 @@ class MlpBlock(nnx.Module):
         use_bias=self.use_bias,
         shard_mode=self.config.shard_mode,
         weight_grad_in_kernel_order=self.config.dense_weight_grad_in_kernel_order,
+        fp32_accumulation=getattr(self.config, "dense_fp32_accumulation", False),
         matmul_precision=self.config.matmul_precision,
         mesh=self.mesh,
         use_two_stage_all_gather=self.config.dense_fsdp_use_two_stage_all_gather,
@@ -765,6 +798,7 @@ class MlpBlock(nnx.Module):
         DecoderBlockType.GEMMA3,
         DecoderBlockType.QWEN3,
         DecoderBlockType.DEEPSEEK,
+        DecoderBlockType.HUNYUAN3,
         DecoderBlockType.LLAMA4,
         DecoderBlockType.OLMO3,
         DecoderBlockType.ENVY,
@@ -805,7 +839,12 @@ class MlpBlock(nnx.Module):
 
       x = checkpoint_name(x, "mlpwi")
       for idx, act_fn in enumerate(self.activations):
-        y = _convert_to_activation_function(act_fn)(x[:, :, idx, ...])
+        xi = x[:, :, idx, ...]
+        if cfg.mlp_activation_round_per_op:
+          xi = xi.astype(jnp.float32)
+        y = _convert_to_activation_function(act_fn)(xi)
+        if cfg.mlp_activation_round_per_op and act_fn != "linear":
+          y = jax.lax.reduce_precision(y, jnp.finfo(self.dtype).nexp, jnp.finfo(self.dtype).nmant)
         activations.append(y)
     else:
       for idx, act_fn in enumerate(self.activations):
@@ -813,9 +852,14 @@ class MlpBlock(nnx.Module):
         module = getattr(self, dense_name)
         x = module(inputs, out_sharding=intermediate_sharding)
         x = checkpoint_name(x, "mlp" + dense_name)
-        if cfg.activations_in_float32:
+        if cfg.activations_in_float32 or cfg.mlp_activation_round_per_op:
           x = x.astype(jnp.float32)
         x = _convert_to_activation_function(act_fn)(x)
+        if cfg.mlp_activation_round_per_op and act_fn != "linear":
+          # one rounding per op: the nonlinearity's output is rounded to dtype before the gating multiply,
+          # whose float32 product of two dtype-representable values is rounded once by the cast below.
+          # reduce_precision is never optimized away (a convert round trip may be, under excess precision).
+          x = jax.lax.reduce_precision(x, jnp.finfo(self.dtype).nexp, jnp.finfo(self.dtype).nmant)
         activations.append(x)
 
     # Take elementwise product of above intermediate activations.

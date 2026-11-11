@@ -568,6 +568,29 @@ class MoEBiasVar(nnx.Variable):
   """Custom NNX Variable for Auxiliary-Loss-Free MoE Routing Bias (DSV4)."""
 
 
+@jax.custom_vjp
+def _round_to_bf16_straight_through(x):
+  """Rounds x to bf16 (RNE) and keeps its dtype; the gradient passes through unrounded.
+
+  reduce_precision rather than a bf16 convert round trip: XLA may drop the round trip when it is allowed excess
+  precision (e.g. bf16 propagation on TPU), reduce_precision is never optimized away. The custom VJP keeps the
+  cotangent in x's dtype: both reduce_precision and a convert round trip would round the gradient to bf16 too,
+  whereas a GPU router with bf16 weights and an fp32 router dtype produces an fp32 weight gradient.
+  """
+  return jax.lax.reduce_precision(x, exponent_bits=8, mantissa_bits=7)
+
+
+def _round_to_bf16_straight_through_fwd(x):
+  return _round_to_bf16_straight_through(x), None
+
+
+def _round_to_bf16_straight_through_bwd(_, g):
+  return (g,)
+
+
+_round_to_bf16_straight_through.defvjp(_round_to_bf16_straight_through_fwd, _round_to_bf16_straight_through_bwd)
+
+
 class GateLogit(nnx.Module):
   """A layer used to compute gate logits, allowing to return the pre bias values for DeepSeek routing."""
 
@@ -588,6 +611,7 @@ class GateLogit(nnx.Module):
       quant: Optional[quantizations.AqtQuantization] = None,
       shard_mode: ShardMode = ShardMode.AUTO,
       matmul_precision: str = "default",
+      bf16_round_kernel: bool = False,
   ):
     """Initializes the GateLogit module.
 
@@ -607,6 +631,11 @@ class GateLogit(nnx.Module):
       score_func: Scoring function for output normalization before applying bias.
       quant: The quantization configuration. If None, no quantization is applied.
       matmul_precision: The precision level for the matrix multiplication.
+      bf16_round_kernel: Round the kernel to bfloat16 (round-to-nearest-even) and back before the matmul.
+        With an FP32 compute dtype (float32_gate_logits=True) the kernel is the FP32 master weight; rounding
+        it makes the matmul operands exactly the bfloat16 values a mixed-precision GPU router uses
+        (bf16 weight x bf16 activation, FP32 accumulate), instead of relying on how the backend rounds
+        FP32 operands at the given matmul precision. The activation is not touched.
     """
     if isinstance(quant, quantizations.ServeFp8WeightQuantization) and not ctypes.is_fp8_dtype(weight_dtype):
       quant = None
@@ -624,6 +653,7 @@ class GateLogit(nnx.Module):
     self.quant = quant
     self.shard_mode = shard_mode
     self.matmul_precision = matmul_precision
+    self.bf16_round_kernel = bf16_round_kernel
 
     # Parameter initialization
     kernel_shape = self.in_features_shape + self.out_features_shape
@@ -645,7 +675,7 @@ class GateLogit(nnx.Module):
     if self.use_bias:
       bias_axes = self.kernel_axes[-len(self.out_features_shape) :]
       bias_shape = kernel_shape[-len(self.out_features_shape) :]
-      if self.model_name.startswith(("deepseek3", "deepseek4", "kimi-k2")):
+      if self.model_name.startswith(("deepseek3", "deepseek4", "kimi-k2", "hunyuan3")):
         # DeepSeek uses MoEBiasVar to naturally isolate from sequence-wise updates
         self.bias = MoEBiasVar(
             default_bias_init(rngs.params(), bias_shape, self.weight_dtype),
@@ -688,6 +718,8 @@ class GateLogit(nnx.Module):
     else:
       kernel = self.kernel[...]
     kernel = jnp.asarray(kernel, self.dtype)
+    if self.bf16_round_kernel:
+      kernel = _round_to_bf16_straight_through(kernel)
 
     contract_ind = tuple(range(0, len(norm_axis)))
     output_sharding = (
@@ -711,7 +743,7 @@ class GateLogit(nnx.Module):
       output = linears._convert_to_activation_function(self.score_func)(output)
 
     # NOTE: deepseek2 has a different pattern
-    if self.model_name.startswith(("deepseek3", "deepseek4", "kimi-k2")):
+    if self.model_name.startswith(("deepseek3", "deepseek4", "kimi-k2", "hunyuan3")):
       pre_bias_logits = output
 
     if self.use_bias:
@@ -1015,6 +1047,7 @@ class RoutedMoE(nnx.Module):
         # See https://github.com/vllm-project/tpu-inference/blob/main/tpu_inference/layers/common/fused_moe_gmm.py#L58.
         score_func="" if self.config.attention in ("vllm_rpa", "vllm_batched_rpa") else self.config.routed_score_func,
         matmul_precision=self.config.matmul_precision,
+        bf16_round_kernel=self.config.routed_gate_bf16_rounding,
         shard_mode=config.shard_mode,
         rngs=self.rngs,
     )
@@ -1351,7 +1384,7 @@ class RoutedMoE(nnx.Module):
         top_k_indices = tid2eid_int[input_ids.astype(jnp.int32)]
         top_k_weights = jnp.take_along_axis(pre_bias_logits, top_k_indices, axis=-1)
       # NOTE: deepseek2 has a different pattern
-      elif self.config.model_name.startswith(("deepseek3", "deepseek4", "kimi-k2")):
+      elif self.config.model_name.startswith(("deepseek3", "deepseek4", "kimi-k2", "hunyuan3")):
         top_k_weights, top_k_indices = self.deepseek_routing(gate_logits, pre_bias_logits)
       elif self.config.decoder_block == ctypes.DecoderBlockType.GEMMA4:
         router_probs = jax.nn.softmax(gate_logits.astype(jnp.float32), axis=-1)
@@ -1360,7 +1393,7 @@ class RoutedMoE(nnx.Module):
       else:
         top_k_weights, top_k_indices = jax.lax.top_k(gate_logits, self.num_experts_per_tok)
 
-    if self.config.decoder_block in (ctypes.DecoderBlockType.DEEPSEEK, ctypes.DecoderBlockType.DEEPSEEK4):
+    if self.config.decoder_block in (ctypes.DecoderBlockType.DEEPSEEK, ctypes.DecoderBlockType.DEEPSEEK4, ctypes.DecoderBlockType.HUNYUAN3):
       top_k_weights = self.deepseek_scale_weights(top_k_weights)
       if valid_token_mask is not None:
         top_k_weights = top_k_weights * valid_token_mask
@@ -1472,7 +1505,23 @@ class RoutedMoE(nnx.Module):
     return top_k_weights, top_k_indices
 
   def apply_ffn_activation(self, layer_w0, layer_w1):
-    """Applies FFN activation function."""
+    """Applies FFN activation function.
+
+    activations_in_float32: the gate and up projections are cast to float32 first, so act(gate) * up is computed
+    in float32 and rounded to `dtype` once at the end.
+    mlp_activation_round_per_op: each op is computed in float32 and its own output rounded to `dtype`, i.e.
+    dtype(dtype(act(float32(gate))) * up) -- what an eager framework does with `dtype` tensors (one rounding per op).
+    GPT-OSS keeps its own activation; with either flag it is computed in float32 and rounded once.
+    """
+    if self.config.mlp_activation_round_per_op or self.config.activations_in_float32:
+      layer_w0 = layer_w0.astype(jnp.float32)
+      layer_w1 = layer_w1.astype(jnp.float32)
+    act_fn = self.activation_fn
+    if self.config.mlp_activation_round_per_op:
+      # reduce_precision rather than astype(dtype).astype(float32): XLA may drop a convert round trip when it
+      # is allowed excess precision; reduce_precision is never optimized away.
+      fi = jnp.finfo(self.dtype)
+      act_fn = lambda v: jax.lax.reduce_precision(self.activation_fn(v), fi.nexp, fi.nmant)  # pylint: disable=unnecessary-lambda-assignment
     with jax.named_scope("ffn_act"):
       if self.config.decoder_block == ctypes.DecoderBlockType.GPT_OSS:
         layer_w0 = jnp.clip(layer_w0, min=None, max=self.config.mlp_activations_limit)
@@ -1485,7 +1534,7 @@ class RoutedMoE(nnx.Module):
         glu = jnp.multiply(layer_w0, layer_act)
         intermediate_layer = jnp.multiply(glu, (layer_w1 + 1))
       elif (
-          self.config.decoder_block in (ctypes.DecoderBlockType.DEEPSEEK, ctypes.DecoderBlockType.DEEPSEEK4)
+          self.config.decoder_block in (ctypes.DecoderBlockType.DEEPSEEK, ctypes.DecoderBlockType.DEEPSEEK4, ctypes.DecoderBlockType.HUNYUAN3)
           and self.config.mlp_activations_limit > 0.0
       ):
         # DeepSeek V4 uses bounds to clip the SwiGLU activations
@@ -1495,10 +1544,10 @@ class RoutedMoE(nnx.Module):
             min=-self.config.mlp_activations_limit,
             max=self.config.mlp_activations_limit,
         )
-        layer_act = self.activation_fn(layer_w0)
+        layer_act = act_fn(layer_w0)
         intermediate_layer = jnp.multiply(layer_act, layer_w1)
       else:
-        layer_act = self.activation_fn(layer_w0)
+        layer_act = act_fn(layer_w0)
         intermediate_layer = jnp.multiply(layer_act, layer_w1)
       return intermediate_layer.astype(self.dtype)
 
@@ -2556,7 +2605,7 @@ class RoutedMoE(nnx.Module):
 
       gate_logits_pspec = self._logical_to_mesh_axes((batch_logical_axis, "activation_norm_length", None))
       # NOTE: deepseek2 has a different pattern
-      if self.config.model_name.startswith(("deepseek3", "deepseek4", "kimi-k2")):
+      if self.config.model_name.startswith(("deepseek3", "deepseek4", "kimi-k2", "hunyuan3")):
         pre_bias_logits_pspec = self._logical_to_mesh_axes((batch_logical_axis, "activation_norm_length", None))
       else:
         # pre_bias_logits is None for non-deepseek3/4 models, including deepseek2
@@ -3907,7 +3956,7 @@ class RoutedMoE(nnx.Module):
     gate_logits_logical_axes = (batch_logical_axis, "activation_norm_length", None)
     pre_bias_logits_logical_axes = (
         (batch_logical_axis, "activation_norm_length", None)
-        if self.config.model_name.startswith(("deepseek3", "deepseek4", "kimi-k2"))
+        if self.config.model_name.startswith(("deepseek3", "deepseek4", "kimi-k2", "hunyuan3"))
         else None
     )
     inputs = self._maybe_shard_with_pspec(inputs, input_partition_pspec, logical_axes=input_logical_axes)
@@ -4347,7 +4396,7 @@ class RoutedMoE(nnx.Module):
     # gate_logits: batch, length, expert
     gate_logits = self._maybe_shard_with_logical(gate_logits, ("activation_batch_moe", "activation_length_moe", None))
     # NOTE: deepseek2 has a different pattern
-    if self.config.model_name.startswith(("deepseek3", "deepseek4", "kimi-k2")):
+    if self.config.model_name.startswith(("deepseek3", "deepseek4", "kimi-k2", "hunyuan3")):
       # pre_bias_logits is None for non-deepseek3/4 models, including deepseek2
       pre_bias_logits = self._maybe_shard_with_logical(
           pre_bias_logits, ("activation_batch_moe", "activation_length_moe", None)
