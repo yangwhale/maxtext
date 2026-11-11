@@ -21,7 +21,11 @@ from absl.testing import parameterized
 
 from maxtext.configs import pyconfig
 from maxtext.utils import maxtext_utils
-from maxtext.utils.maxtext_utils import calculate_tflops_training_per_device
+from maxtext.utils.maxtext_utils import (
+    calculate_indexer_tflops_per_device,
+    calculate_mhc_flops_per_layer,
+    calculate_tflops_training_per_device,
+)
 from tests.utils.test_helpers import get_test_config_path
 
 
@@ -429,6 +433,45 @@ class FlopCalculation(parameterized.TestCase):
     # Verify our calculated FLOPs align within 5% tolerance of the standard 6BP analytical baseline
     self.assertFlopsAlmostEqual(calculated_total, golden_total_flops)
     self.assertFlopsAlmostEqual(calculated_weight, golden_weight_flops)
+
+  def test_hy4_flop_terms(self):
+    """Hy4 terms: gated-MLA gate projection, IndexCache sharing layers, iHC and mHC hyper-connections."""
+    base = dict(max_target_length=8192, per_device_batch_size=1, attention="dot_product")
+    cfg = self._initialize_model_config("hy4-preview", **base)
+    B, S, D = cfg.per_device_batch_size, cfg.max_target_length, cfg.emb_dim
+    total, _, _ = calculate_tflops_training_per_device(cfg)
+    tol = 1e-9  # the differences below are exact, so a loose tolerance would hide an off-by-one layer
+
+    # The gate projection doubles the output projection term of every layer (dense, MoE and MTP).
+    no_gate = self._initialize_model_config("hy4-preview", attention_output_gate=None, **base)
+    gate = 2 * B * S * D * cfg.num_query_heads * cfg.v_head_dim * (cfg.num_decoder_layers + cfg.mtp_num_layers)
+    self.assertFlopsAlmostEqual(total - calculate_tflops_training_per_device(no_gate)[0], 3 * gate / 1e12, tol)
+
+    # IndexCache: the dense layers and the first MoE layer of every group run the indexer, the rest share it.
+    num_moe = cfg.num_decoder_layers - cfg.first_num_dense_layers
+    num_sharing = num_moe - -(-num_moe // cfg.indexer_share_interval)
+    self.assertEqual(num_sharing, 57)  # hy4-preview: 1 dense + 77 MoE layers, interval 4
+    every_layer = self._initialize_model_config("hy4-preview", indexer_share_interval=1, **base)
+    proj, score = calculate_indexer_tflops_per_device(cfg)
+    self.assertFlopsAlmostEqual(
+        calculate_tflops_training_per_device(every_layer)[0] - total, 3 * (proj + score) * num_sharing / 1e12, tol
+    )
+
+    # iHC: two hyper-connections per layer plus the HC head.
+    k = cfg.mhc_expansion_rate
+    no_hc = self._initialize_model_config("hy4-preview", mhc_expansion_rate=1, hc_variant="mhc", use_hc_head=False, **base)
+    no_hc_total = calculate_tflops_training_per_device(no_hc)[0]
+    per_hc = 2 * B * S * k * D * 2 * k + 2 * B * S * k * D + B * S * k * D
+    head = 2 * B * S * k * D * k + 2 * B * S * k * D
+    self.assertFlopsAlmostEqual(total - no_hc_total, 3 * (2 * per_hc * cfg.num_decoder_layers + head) / 1e12, tol)
+
+    # mHC on the same block, without the head: two per layer of the mHC per-layer count.
+    mhc = self._initialize_model_config("hy4-preview", hc_variant="mhc", use_hc_head=False, **base)
+    self.assertFlopsAlmostEqual(
+        calculate_tflops_training_per_device(mhc)[0] - no_hc_total,
+        3 * 2 * calculate_mhc_flops_per_layer(mhc) * cfg.num_decoder_layers / 1e12,
+        tol,
+    )
 
   def test_deepseek4_mtp_validation(self):
     """Test that DeepSeek-V4 with MTP layers raises a ValueError"""

@@ -29,6 +29,7 @@ from absl.testing import parameterized
 from flax import nnx
 from flax.linen import partitioning as nn_partitioning
 import jax
+from jax._src import ad_checkpoint
 import jax.numpy as jnp
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask
 from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec
@@ -46,6 +47,7 @@ from maxtext.common.common_types import (
     DEFAULT_MASK_VALUE,
     Q_LENGTH,
 )
+from maxtext.layers import attention_mla
 from maxtext.layers.attention_mla import MLA
 from maxtext.layers import attention_compressed
 from maxtext.layers.attention_compressed import CompressedAttention
@@ -3623,6 +3625,117 @@ class MLATest(attention_test_util.MLATestBase):
       "mla_naive_kvcache": False,
   }
 
+  def _mla_train_out(self, mla, cfg):
+    lnx, decoder_segment_ids, decoder_positions = self.get_structured_data(cfg, cfg.dtype)
+    out, _ = mla(
+        lnx,
+        lnx,
+        decoder_segment_ids=decoder_segment_ids,
+        inputs_positions=decoder_positions,
+        deterministic=True,
+        model_mode=MODEL_MODE_TRAIN,
+    )
+    return np.asarray(out, np.float64)
+
+  def test_mla_elementwise_output_gate(self):
+    """A zero gate kernel gives sigmoid(0) = 0.5 on every head and value channel before the output projection."""
+    cfg, mla = self.init_mla({**self.config_arguments, "attention_output_gate": "elementwise"}, "default")
+    self.assertIsNotNone(mla.gate_proj)
+    mla.gate_proj.kernel.value = jnp.zeros_like(mla.gate_proj.kernel.value)
+    gated = self._mla_train_out(mla, cfg)
+    gate_proj, mla.gate_proj = mla.gate_proj, None
+    ungated = self._mla_train_out(mla, cfg)
+    np.testing.assert_allclose(gated, 0.5 * ungated, rtol=1e-5, atol=1e-6)
+    # Negative control: a non-zero gate must not reduce to the constant factor.
+    gate_proj.kernel.value = jax.random.normal(jax.random.PRNGKey(3), gate_proj.kernel.value.shape)
+    mla.gate_proj = gate_proj
+    self.assertFalse(np.allclose(self._mla_train_out(mla, cfg), 0.5 * ungated, rtol=1e-5, atol=1e-6))
+
+  def test_mla_attention_gate_saved_across_remat(self):
+    """Under a remat saving only "attention_gate", a [batch, seq, heads, v_head_dim] residual carries that name, so the
+    backward does not recompute the gate projection; with another name nothing does. Fails if the tag is dropped."""
+    cfg, mla = self.init_mla({**self.config_arguments, "attention_output_gate": "elementwise"}, "default")
+    lnx, decoder_segment_ids, decoder_positions = self.get_structured_data(cfg, cfg.dtype)
+    graphdef, params, rest = nnx.split(mla, nnx.Param, ...)
+
+    def named_residuals(name):
+      def f(p, x):
+        m = nnx.merge(graphdef, p, rest)
+        out, _ = m(
+            x, x, decoder_segment_ids=decoder_segment_ids, inputs_positions=decoder_positions, deterministic=True,
+            model_mode=MODEL_MODE_TRAIN,
+        )
+        return out
+
+      g = jax.checkpoint(f, policy=jax.checkpoint_policies.save_only_these_names(name))
+      res = ad_checkpoint.saved_residuals(lambda p, x: jnp.sum(g(p, x)), params, lnx)
+      return [a.shape for a, desc in res if "attention_gate" in desc]
+
+    want = (lnx.shape[0], lnx.shape[1], cfg.num_query_heads, cfg.v_head_dim)
+    self.assertEqual(named_residuals("attention_gate"), [want])
+    self.assertEqual(named_residuals("no_such_name"), [])
+
+    # Saving the gate only changes where the backward reads it from: loss and gradients match recomputing it.
+    def loss_and_grads(policy):
+      def f(p, x):
+        m = nnx.merge(graphdef, p, rest)
+        out, _ = m(
+            x, x, decoder_segment_ids=decoder_segment_ids, inputs_positions=decoder_positions, deterministic=True,
+            model_mode=MODEL_MODE_TRAIN,
+        )
+        return jnp.sum(out**2)
+
+      return jax.value_and_grad(jax.checkpoint(f, policy=policy))(params, lnx)
+
+    v0, g0 = loss_and_grads(jax.checkpoint_policies.save_only_these_names("no_such_name"))
+    v1, g1 = loss_and_grads(jax.checkpoint_policies.save_only_these_names("attention_gate"))
+    np.testing.assert_allclose(v1, v0, rtol=1e-6)
+    for a, b in zip(jax.tree.leaves(g0), jax.tree.leaves(g1)):
+      np.testing.assert_allclose(np.asarray(b), np.asarray(a), rtol=1e-5, atol=1e-6)
+
+  def test_attention_gate_reaches_custom_remat_policy(self):
+    """attention_gate=device / offload lands in tensors_on_device / tensors_to_offload under remat_policy=custom."""
+    for value, field in (("device", "tensors_on_device"), ("offload", "tensors_to_offload")):
+      cfg, _ = self.init_mla(
+          {**self.config_arguments, "attention_output_gate": "elementwise", "remat_policy": "custom",
+           "attention_gate": value},
+          "default",
+      )
+      self.assertIn("attention_gate", getattr(cfg, field))
+
+  def test_mla_passes_attention_sinks(self):
+    """MLA forwards its sinks to the attention op: a -1e9 sink is a no-op, a zero sink changes the output."""
+    cfg, mla = self.init_mla({**self.config_arguments, "attention_sink": True}, "default")
+    self.assertIsNotNone(mla.sinks)
+    sinks = mla.sinks
+    mla.sinks = None
+    no_sink = self._mla_train_out(mla, cfg)
+    mla.sinks = sinks
+    mla.sinks.value = jnp.full_like(mla.sinks.value, -1e9)
+    np.testing.assert_allclose(self._mla_train_out(mla, cfg), no_sink, rtol=1e-5, atol=1e-6)
+    mla.sinks.value = jnp.zeros_like(mla.sinks.value)
+    self.assertFalse(np.allclose(self._mla_train_out(mla, cfg), no_sink, rtol=1e-5, atol=1e-6))
+
+  def test_mla_lora_norm_epsilon(self):
+    cfg, mla = self.init_mla({**self.config_arguments, "mla_lora_norm_epsilon": 1e-3}, "default")
+    self.assertEqual(mla.q_norm.epsilon, 1e-3)
+    self.assertEqual(mla.kv_norm.epsilon, 1e-3)
+    cfg, mla = self.init_mla(self.config_arguments, "default")
+    self.assertEqual(mla.q_norm.epsilon, cfg.normalization_layer_epsilon)
+    self.assertEqual(mla.kv_norm.epsilon, cfg.normalization_layer_epsilon)
+
+  def test_mla_option_config_validation(self):
+    for bad in (
+        {"attention_output_gate": "elementwise", "attention_type": "global"},
+        {"mla_lora_norm_epsilon": 0.0},
+        {"use_batch_split_schedule": True, "attention_output_gate": "elementwise"},
+        {"attention_gate": "device"},  # no gated attention: nothing carries the name
+    ):
+      with self.assertRaises(ValueError, msg=str(bad)):
+        self.init_mla({**self.config_arguments, **bad}, "default")
+    with self.assertRaisesRegex(ValueError, "attention_gate=device needs gated attention"):
+      self.init_mla({**self.config_arguments, "attention_gate": "device"}, "default")
+
   @parameterized.named_parameters(
       {"testcase_name": "RoPE_Yarn_Autoregression", "rope_type": "yarn"},
       {"testcase_name": "Default_Autoregression", "rope_type": "default"},
@@ -4861,6 +4974,82 @@ class MLATest(attention_test_util.MLATestBase):
             model_mode=MODEL_MODE_TRAIN,
         )
         self.assertIsNotNone(out)
+
+  def test_kth_largest_matches_top_k(self):
+    """kth_largest returns the same cutoff as jax.lax.top_k, including ties, masked entries and both zeros."""
+    rng = np.random.default_rng(0)
+    for k in (1, 3, 64, 500, 1024):
+      with self.subTest(k=k):
+        x = rng.standard_normal((2, 8, 1024)).astype(np.float32)
+        x[0, :, ::7] = 0.25  # ties around the cutoff
+        x[1, :, 512:] = DEFAULT_MASK_VALUE  # causally masked half
+        x[0, 0, :4] = [0.0, -0.0, 0.0, -0.0]
+        x[1, 1] = np.round(x[1, 1])  # heavy ties
+        want = jax.lax.top_k(jnp.asarray(x), k)[0][..., -1]
+        got = attention_mla.kth_largest(jnp.asarray(x), k)
+        np.testing.assert_array_equal(np.asarray(got) == np.asarray(want), True)
+
+  def test_indexer_kth_select_same_mask(self):
+    """The cutoff from kth_largest gives the same indexer mask as the full top_k values, ties included."""
+    mla_config_args = self.config_arguments.copy()
+    mla_config_args["use_indexer"] = True
+    mla_config_args["indexer_topk"] = 4
+    mla_config_args["attention"] = "dot_product"
+    _, mla = self.init_mla(mla_config_args, rope_type="default")
+    rng = np.random.default_rng(1)
+    scores = rng.standard_normal((2, 16, 64)).astype(np.float32)
+    scores[0, :, ::5] = 0.5  # ties straddling the cutoff exercise the exact-k tie pruning
+    scores = jnp.asarray(scores)
+    for k in (1, 4, 13):
+      with self.subTest(k=k):
+        want = mla.indexer.generate_mask(scores, jax.lax.top_k(scores, k)[0])
+        got = mla.indexer.generate_mask(scores, attention_mla.kth_largest(scores, k)[..., None], k=k)
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+  def test_kth_largest_bf16_and_bad_k(self):
+    """bfloat16 input keeps its dtype and matches top_k; k outside (0, s] raises."""
+    x = jnp.asarray(np.random.default_rng(2).standard_normal((3, 257)), dtype=jnp.bfloat16)
+    for k in (1, 17, 257):
+      got = attention_mla.kth_largest(x, k)
+      self.assertEqual(got.dtype, jnp.bfloat16)
+      np.testing.assert_array_equal(np.asarray(got, np.float32), np.asarray(jax.lax.top_k(x, k)[0][..., -1], np.float32))
+    for k in (0, 258):
+      with self.assertRaises(ValueError):
+        attention_mla.kth_largest(x, k)
+
+  def test_indexer_kth_select_wiring(self):
+    """With the same weights and inputs, the Indexer gives the same mask with indexer_kth_select on and off."""
+    masks = []
+    state = None
+    for kth in (False, True):
+      mla_config_args = self.config_arguments.copy()
+      mla_config_args["use_indexer"] = True
+      mla_config_args["indexer_kth_select"] = kth
+      mla_config_args["indexer_topk"] = 4
+      mla_config_args["attention"] = "dot_product"
+      cfg, mla = self.init_mla(mla_config_args, rope_type="default")
+      if state is None:
+        state = nnx.state(mla)
+        lnx, decoder_segment_ids, decoder_positions = self.get_structured_data(cfg, cfg.dtype)
+      else:
+        nnx.update(mla, state)
+      out, _ = mla(
+          lnx,
+          lnx,
+          decoder_segment_ids=decoder_segment_ids,
+          inputs_positions=decoder_positions,
+          deterministic=True,
+          model_mode=MODEL_MODE_TRAIN,
+      )
+      masks.append(np.asarray(out))
+    np.testing.assert_array_equal(masks[0], masks[1])
+
+  def test_indexer_kth_select_rejects_approx(self):
+    """indexer_kth_select cannot be combined with indexer_use_approx_top_k."""
+    mla_config_args = self.config_arguments.copy()
+    mla_config_args.update(use_indexer=True, indexer_kth_select=True, indexer_use_approx_top_k=True)
+    with self.assertRaises(ValueError):
+      self.init_mla(mla_config_args, rope_type="default")
 
   def test_approx_top_k_recall(self):
     """Verify that approx_max_k meets the specified recall target compared to exact top_k."""

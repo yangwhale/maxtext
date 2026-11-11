@@ -16,6 +16,7 @@
 """Utils that are only interesting to MaxText."""
 
 import functools
+import math
 import os
 from typing import Sequence
 
@@ -706,6 +707,9 @@ def calculate_mla_tflops_per_device(config):
     )
     attention_flops = attention_flops / 2
   projection_flops = 2 * batch_len * config.emb_dim * config.num_query_heads * config.v_head_dim
+  if config.attention_output_gate == "elementwise":
+    # Gated MLA: gate_proj (emb -> heads x v_head_dim) is one more matmul of the output projection's size.
+    projection_flops *= 2
   return qkv_flops, attention_flops, projection_flops
 
 
@@ -997,6 +1001,41 @@ def calculate_vision_encoder_tflops(config):
   return mm_total_tflops, mm_learnable_weight_tflops, mm_attention_tflops
 
 
+def calculate_deepseek_block_extra_flops(config):
+  """FLOPs of DeepSeek-block features that the per-layer MLA / FFN terms do not cover, per device and forward pass.
+
+  Returns (weight_flops, attention_flops) to add to the totals (either can be negative):
+  - DSA IndexCache (use_indexer, indexer_share_interval > 1): only the dense layers and the first MoE layer of each
+    group run the indexer, so the indexer projection and scoring that the per-layer MLA term counts for every layer
+    are removed for the sharing layers. The sparse attention itself still runs on every layer.
+  - Hyper-connections (mhc_expansion_rate > 1): two per layer plus the HC head. iHC has the pre / post gate
+    projections, the weighted stream sum and the post outer product; mHC also has the residual mixing.
+  """
+  batch_len = config.per_device_batch_size * config.max_target_length
+  weight_flops, attention_flops = 0.0, 0.0
+  if config.use_indexer and config.indexer_share_interval > 1 and config.max_target_length > config.indexer_topk:
+    num_dense_layers, num_moe_layers = get_dense_moe_layers(config)
+    num_indexer_layers = num_dense_layers + math.ceil(num_moe_layers / config.indexer_share_interval)
+    num_sharing_layers = config.num_decoder_layers - num_indexer_layers
+    indexer_proj_flops, indexer_scoring_flops = calculate_indexer_tflops_per_device(config)
+    weight_flops -= indexer_proj_flops * num_sharing_layers
+    attention_flops -= indexer_scoring_flops * num_sharing_layers
+  k = config.mhc_expansion_rate
+  if k > 1:
+    d = config.emb_dim
+    if config.hc_variant == "ihc":
+      gates = 2 * batch_len * (k * d) * (2 * k)  # pre and post gate projections
+      stream_sum = 2 * batch_len * k * d
+      post_outer = batch_len * k * d
+      per_hc = gates + stream_sum + post_outer
+    else:
+      per_hc = calculate_mhc_flops_per_layer(config)
+    weight_flops += 2 * per_hc * config.num_decoder_layers
+    if config.use_hc_head:
+      weight_flops += 2 * batch_len * (k * d) * k + 2 * batch_len * k * d
+  return weight_flops, attention_flops
+
+
 def calculate_mhc_flops_per_layer(config):
   """Calculates the training FLOPs per layer for Manifold-Constrained Hyper-Connections (mHC)."""
   batch_size = config.per_device_batch_size
@@ -1262,12 +1301,18 @@ def calculate_tflops_training_per_device(config, log=True):
         config, total_ffn_flops_all_layers, embedding_flops
     )
   elif config.decoder_block == DecoderBlockType.DEEPSEEK:
+    extra_weight_flops, extra_attention_flops = calculate_deepseek_block_extra_flops(config)
     learnable_weight_tflops = (
-        (total_ffn_flops_all_layers + (qkv_flops + projection_flops) * config.num_decoder_layers + embedding_flops)
+        (
+            total_ffn_flops_all_layers
+            + (qkv_flops + projection_flops) * config.num_decoder_layers
+            + embedding_flops
+            + extra_weight_flops
+        )
         * 3
         / 10**12
     )
-    attention_tflops = causal_attention_flops * config.num_decoder_layers * 3 / 10**12
+    attention_tflops = (causal_attention_flops * config.num_decoder_layers + extra_attention_flops) * 3 / 10**12
   elif config.decoder_block == DecoderBlockType.QWEN3_CUSTOM_MOE:
     # Attention output projects (num_query_heads * head_dim) -> attention_output_dim, not -> emb_dim.
     qwen3_custom_proj_flops = (

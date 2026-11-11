@@ -165,6 +165,16 @@ class AttentionType(enum.Enum):
   BLOCK_DIFFUSION = "block_diffusion"
 
 
+# Attention types whose training mask is exactly the square causal mask (kv <= q), with no window, chunk,
+# compressed or bidirectional part. splash_static_causal_partial_mask accepts only these (with use_indexer, which
+# allows 'mla' or 'compressed', only MLA is reachable).
+PLAIN_CAUSAL_ATTENTION_TYPES = (AttentionType.GLOBAL, AttentionType.MLA)
+
+# Private helpers of tokamax `splash_attention_mask_info` that splash_static_causal_partial_mask calls (verified
+# with tokamax 0.0.16; requirements only pin tokamax>=0.0.14).
+SPLASH_STATIC_CAUSAL_TOKAMAX_HELPERS = ("_generate_shard_metadata", "_process_dynamic_mask", "_downcast_to_small_type")
+
+
 class ShardMode(enum.Enum):
   AUTO = "auto"  # default
   EXPLICIT = "explicit"

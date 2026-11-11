@@ -493,6 +493,9 @@ class Attention(nnx.Module):
           epsilon=self.config.normalization_layer_epsilon,
           kernel_axes=("norm",),
           with_scale=with_scale,
+          single_rounding=getattr(self.config, "rmsnorm_single_rounding", False),
+          scale_grad_fp32=getattr(self.config, "rmsnorm_scale_grad_fp32", False),
+          scale_grad_gpu_order=getattr(self.config, "rmsnorm_scale_grad_gpu_order", False),
           rngs=self.rngs,
       )
       if self.share_kv_layer:
@@ -506,6 +509,9 @@ class Attention(nnx.Module):
             epsilon=self.config.normalization_layer_epsilon,
             kernel_axes=("norm",),
             with_scale=with_scale,
+            single_rounding=getattr(self.config, "rmsnorm_single_rounding", False),
+            scale_grad_fp32=getattr(self.config, "rmsnorm_scale_grad_fp32", False),
+            scale_grad_gpu_order=getattr(self.config, "rmsnorm_scale_grad_gpu_order", False),
             rngs=self.rngs,
         )
     elif self.is_qwen3_hybrid:
@@ -691,6 +697,7 @@ class Attention(nnx.Module):
         weight_dtype=self.weight_dtype,
         quant=self.quant,
         matmul_precision=self.config.matmul_precision,
+        fp32_accumulation=getattr(self.config, "dense_fp32_accumulation", False),
         use_bias=self.use_bias_in_projections,
         shard_mode=self.config.shard_mode,
         block_size=block_size,
@@ -732,6 +739,7 @@ class Attention(nnx.Module):
         quant=self.quant,
         shard_mode=self.config.shard_mode,
         matmul_precision=self.config.matmul_precision,
+        fp32_accumulation=getattr(self.config, "dense_fp32_accumulation", False),
         use_bias=self.use_bias_in_projections,
         block_size=block_size,
         rngs=self.rngs,
@@ -774,6 +782,7 @@ class Attention(nnx.Module):
         quant=self.quant,
         shard_mode=self.config.shard_mode,
         matmul_precision=self.config.matmul_precision,
+        fp32_accumulation=getattr(self.config, "dense_fp32_accumulation", False),
         use_bias=self.use_bias_in_projections,
         rngs=self.rngs,
     )
@@ -830,6 +839,7 @@ class Attention(nnx.Module):
         quant=self.quant,
         shard_mode=self.config.shard_mode,
         matmul_precision=self.config.matmul_precision,
+        fp32_accumulation=getattr(self.config, "dense_fp32_accumulation", False),
         use_bias=False if self.is_qwen2 else self.use_bias_in_projections,
         block_size=block_size,
         rngs=self.rngs,

@@ -26,6 +26,7 @@ from flax.core import FrozenDict
 from flax import nnx
 
 from maxtext.common.common_types import Config, DECODING_ACTIVE_SEQUENCE_INDICATOR, MODEL_MODE_AUTOREGRESSIVE, MODEL_MODE_TRAIN, MultimodalInput
+from maxtext.common.common_types import ShardMode
 from maxtext.layers.nnx_decoders import NNXDecoder
 from maxtext.layers import initializers
 from maxtext.layers import nnx_wrappers
@@ -34,6 +35,7 @@ from maxtext.layers.encoders import AudioEncoder, VisionEncoder
 from maxtext.layers.multi_token_prediction import MultiTokenPredictionBlock
 from maxtext.layers.quantizations import AqtQuantization as Quant
 from maxtext.multimodal import processor as mm_processor
+from maxtext.utils.sharding import create_sharding
 
 # ------------------------------------------------------------------------------
 # The network: Transformer Definitions
@@ -203,6 +205,7 @@ class Transformer(nnx.Module):
       attention_metadata: dict[str, Any] | None = None,
       forced_routed_experts: jnp.ndarray | None = None,
       decoder_input_embeddings: jax.Array | None = None,
+      forced_indexer_topk: jnp.ndarray | None = None,
   ):
     """Applies the Zero-1 FSDP wrapped Transformer model.
 
@@ -309,6 +312,7 @@ class Transformer(nnx.Module):
         attention_metadata=attention_metadata,
         deepstack_visual_embeds=deepstack_visual_embeds,
         forced_routed_experts=forced_routed_experts,
+        **({} if forced_indexer_topk is None else {"forced_indexer_topk": forced_indexer_topk}),
     )  # pytype: disable=wrong-keyword-args
     if isinstance(res, tuple) and len(res) == 4:
       logits, hidden_state, kv_caches, expert_indices = res
@@ -336,9 +340,26 @@ class Transformer(nnx.Module):
     #      logit projection.
     # Its only effect is to "sow" these losses; it does not alter the primary logits output.
     if getattr(self.config, "mtp_num_layers", 0) > 0:
+      mtp_main_hidden_state = hidden_state
+      mtp_replay_kwargs = {}
+      if forced_routed_experts is not None and getattr(self.config, "debug_forced_routing_deepseek", False):
+        # Router replay for the MTP layers: the slots after the decoder layers, [mtp_num_layers, batch, seq, top_k].
+        n = self.config.num_decoder_layers
+        mtp_replay_kwargs["forced_routed_experts"] = jnp.moveaxis(forced_routed_experts[:, :, n:], 2, 0)
+      if forced_indexer_topk is not None:
+        # Indexer top-k replay for the MTP layers (debug_forced_indexer_topk), [mtp_num_layers, batch, seq, topk].
+        n = self.config.num_decoder_layers
+        mtp_replay_kwargs["forced_indexer_topk"] = jnp.moveaxis(forced_indexer_topk[:, :, n:], 2, 0)
+      if self.config.mtp_input_post_final_norm:
+        # Feed MTP the main model's final-normed hidden state instead of the pre-norm one, with the same output
+        # sharding as the decoder's own call to decoder_norm in apply_output_head.
+        norm_out_sharding = None
+        if self.config.shard_mode == ShardMode.EXPLICIT:
+          norm_out_sharding = create_sharding(self.mesh, ("activation_batch", "activation_length", "activation_embed"))
+        mtp_main_hidden_state = self.decoder.decoder_norm(hidden_state, out_sharding=norm_out_sharding)
       self.mtp_block(
           shared_embedding=self.token_embedder,
-          main_hidden_state=hidden_state,
+          main_hidden_state=mtp_main_hidden_state,
           input_ids=decoder_input_tokens,
           target_ids=decoder_target_tokens,
           target_mask=decoder_target_mask,
@@ -347,6 +368,7 @@ class Transformer(nnx.Module):
           deterministic=not enable_dropout,
           model_mode=model_mode,
           main_token_embeddings=mtp_token_embeddings,
+          **mtp_replay_kwargs,
       )
 
     if self.config.attention in ("vllm_rpa", "vllm_batched_rpa"):

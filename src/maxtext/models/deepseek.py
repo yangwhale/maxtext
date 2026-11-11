@@ -17,7 +17,7 @@
 # pylint: disable=no-name-in-module
 
 import functools
-from typing import Optional
+from typing import Any, Optional
 
 from flax import nnx
 import jax
@@ -40,6 +40,7 @@ from maxtext.layers.normalizations import RMSNorm
 from maxtext.models import deepseek_batchsplit
 from maxtext.models import deepseek_batchsplit_fp8
 from maxtext.utils import max_utils
+from maxtext.utils import maxtext_utils
 from maxtext.utils.sharding import create_sharding
 from maxtext.utils.sharding import maybe_shard_with_logical
 from maxtext.utils.sharding import get_logical_axis_rules
@@ -49,6 +50,22 @@ import transformers
 # -----------------------------------------
 # The Decoder Layer for DeepSeek v3
 # -----------------------------------------
+
+
+def _indexer_kwargs(shared_indexer_mask, return_indexer_mask, forced_indexer_topk=None):
+  """DSA IndexCache kwargs for the attention call, only those that are set (other attention types lack them).
+
+  forced_indexer_topk (debug_forced_indexer_topk): [batch, seq, indexer_topk] key positions; only read by a layer
+  that runs its own indexer.
+  """
+  kwargs = {}
+  if forced_indexer_topk is not None:
+    kwargs["forced_indexer_topk"] = forced_indexer_topk
+  if shared_indexer_mask is not None:
+    kwargs["shared_indexer_mask"] = shared_indexer_mask
+  if return_indexer_mask:
+    kwargs["return_indexer_mask"] = True
+  return kwargs
 
 
 class DeepSeekGenericLayer(nnx.Module):
@@ -66,13 +83,19 @@ class DeepSeekGenericLayer(nnx.Module):
       rngs: nnx.Rngs,
       quant: Optional[quantizations.AqtQuantization] = None,
       layer_idx: int = -1,
+      use_hyper_connections: Optional[bool] = None,
+      has_indexer: Optional[bool] = None,
   ) -> None:
     self.config = config
     self.model_mode = model_mode
     self.mesh = mesh
     self.quant = quant
     self.rngs = rngs
-    self.is_mhc_enabled = config.mhc_expansion_rate > 1
+    # None: follow mhc_expansion_rate. False: a plain residual layer on a 3D state even in an mHC model
+    # (e.g. the generic MTP layer, which runs on the collapsed hidden state).
+    if use_hyper_connections and config.mhc_expansion_rate <= 1:
+      raise ValueError("use_hyper_connections=True requires mhc_expansion_rate > 1.")
+    self.is_mhc_enabled = config.mhc_expansion_rate > 1 if use_hyper_connections is None else use_hyper_connections
     self.layer_idx = layer_idx
     self.is_engram_enabled = config.engram_layers and layer_idx in config.engram_layers
 
@@ -89,6 +112,9 @@ class DeepSeekGenericLayer(nnx.Module):
         dtype=self.config.dtype,
         weight_dtype=self.config.weight_dtype,
         kernel_axes=("norm",),
+        single_rounding=getattr(self.config, "rmsnorm_single_rounding", False),
+        scale_grad_fp32=getattr(self.config, "rmsnorm_scale_grad_fp32", False),
+        scale_grad_gpu_order=getattr(self.config, "rmsnorm_scale_grad_gpu_order", False),
         epsilon=self.config.normalization_layer_epsilon,
         rngs=rngs,
     )
@@ -98,6 +124,9 @@ class DeepSeekGenericLayer(nnx.Module):
         dtype=self.config.dtype,
         weight_dtype=self.config.weight_dtype,
         kernel_axes=("norm",),
+        single_rounding=getattr(self.config, "rmsnorm_single_rounding", False),
+        scale_grad_fp32=getattr(self.config, "rmsnorm_scale_grad_fp32", False),
+        scale_grad_gpu_order=getattr(self.config, "rmsnorm_scale_grad_gpu_order", False),
         epsilon=self.config.normalization_layer_epsilon,
         rngs=rngs,
     )
@@ -171,12 +200,16 @@ class DeepSeekGenericLayer(nnx.Module):
           model_mode=model_mode,
           rngs=rngs,
           attn_logits_soft_cap=self.config.attn_logits_soft_cap,
+          has_indexer=has_indexer,
+          # dot_product attention only; MLA took the constructor defaults (False) before, so these configs were ignored
+          float32_qk_product=self.config.float32_qk_product,
+          float32_logits=self.config.float32_logits,
       )
 
     self.dropout = Dropout(rate=self.config.dropout_rate, broadcast_dims=(-2,), rngs=self.rngs)
     if self.is_mhc_enabled:
-      self.mhc_attention = mhc.ManifoldConstrainedHyperConnections(self.config, self.config.emb_dim, self.mesh, self.rngs)
-      self.mhc_mlp = mhc.ManifoldConstrainedHyperConnections(self.config, self.config.emb_dim, self.mesh, self.rngs)
+      self.mhc_attention = mhc.make_hyper_connections(self.config, self.config.emb_dim, self.mesh, self.rngs)
+      self.mhc_mlp = mhc.make_hyper_connections(self.config, self.config.emb_dim, self.mesh, self.rngs)
 
   def mlp_op(self, x, deterministic, *args, **kwargs):
     """Executes the MLP operation. To be implemented by subclasses."""
@@ -214,9 +247,14 @@ class DeepSeekGenericLayer(nnx.Module):
       model_mode,
       previous_chunk=None,
       slot: None | int = None,
+      **indexer_kwargs,
   ):
-    """Executes the attention layer."""
-    attention_result, _ = self.self_attention(
+    """Executes the attention layer.
+
+    indexer_kwargs (DSA IndexCache, MLA only): shared_indexer_mask, return_indexer_mask. With
+    return_indexer_mask=True this returns (attention_result, indexer_mask).
+    """
+    attention_outputs = self.self_attention(
         x,
         x,
         decoder_positions,
@@ -226,8 +264,12 @@ class DeepSeekGenericLayer(nnx.Module):
         out_sharding=self.out_sharding,
         previous_chunk=previous_chunk,
         slot=slot,
+        **indexer_kwargs,
     )
-    return self.with_logical_constraint(attention_result)
+    attention_result = self.with_logical_constraint(attention_outputs[0])
+    if indexer_kwargs.get("return_indexer_mask"):
+      return attention_result, attention_outputs[2]
+    return attention_result
 
   @property
   def logical_axis_names(self):
@@ -283,10 +325,16 @@ class DeepSeekGenericLayer(nnx.Module):
       model_mode,
       previous_chunk=None,
       slot: None | int = None,
+      **indexer_kwargs,
   ):
-    """self-attention with normalization"""
+    """self-attention with normalization.
+
+    indexer_kwargs (DSA IndexCache): shared_indexer_mask, return_indexer_mask; with return_indexer_mask=True the
+    attention layer's top-k mask is returned as a third output.
+    """
+    indexer_mask = None
     if self.is_mhc_enabled:
-      intermediate_inputs, _ = self.mhc_attention(
+      intermediate_inputs, attention_metadata = self.mhc_attention(
           self.pre_attention_norm_op,
           self.self_attention,
           x=inputs,
@@ -298,7 +346,9 @@ class DeepSeekGenericLayer(nnx.Module):
           out_sharding=self.out_sharding,
           previous_chunk=previous_chunk,
           slot=slot,
+          **indexer_kwargs,
       )
+      indexer_mask = attention_metadata.get("indexer_mask")
     else:
       lnx = self.pre_attention_norm_op(inputs)
       attention_lnx = self.attention_op(
@@ -309,10 +359,17 @@ class DeepSeekGenericLayer(nnx.Module):
           model_mode,
           previous_chunk,
           slot,
+          **indexer_kwargs,
       )
+      if indexer_kwargs.get("return_indexer_mask"):
+        attention_lnx, indexer_mask = attention_lnx
       intermediate_inputs = inputs + attention_lnx
-    # Normalization
-    hidden_states = self.post_attention_norm_op(intermediate_inputs)
+    # Normalization. With hyper-connections the MLP branch normalizes its own iHC/mHC-mixed input (mhc_mlp is handed
+    # post_attention_norm_op), so this result is unused there; skip it, since flat streams (use_ihc_pallas_kernel,
+    # (batch, seq, k * emb)) do not end in emb.
+    hidden_states = None if self.is_mhc_enabled else self.post_attention_norm_op(intermediate_inputs)
+    if indexer_kwargs.get("return_indexer_mask"):
+      return hidden_states, intermediate_inputs, indexer_mask
     return hidden_states, intermediate_inputs
 
   def engram_op(self, x, decoder_input_tokens):
@@ -332,8 +389,19 @@ class DeepSeekDenseLayer(DeepSeekGenericLayer):
       rngs: nnx.Rngs,
       quant: Optional[quantizations.AqtQuantization] = None,
       layer_idx: int = -1,
+      use_hyper_connections: Optional[bool] = None,
+      has_indexer: Optional[bool] = None,
   ) -> None:
-    super().__init__(config, model_mode, mesh, rngs, quant, layer_idx)
+    super().__init__(
+        config,
+        model_mode,
+        mesh,
+        rngs,
+        quant,
+        layer_idx,
+        use_hyper_connections=use_hyper_connections,
+        has_indexer=has_indexer,
+    )
     self.mlp = linears.MlpBlock(
         in_features=self.dummy_inputs_shape[-1],
         intermediate_dim=self.config.mlp_dim,
@@ -364,6 +432,9 @@ class DeepSeekDenseLayer(DeepSeekGenericLayer):
       kv_cache=None,
       attention_metadata=None,
       decoder_input_tokens=None,
+      shared_indexer_mask=None,
+      return_indexer_mask: bool = False,
+      forced_indexer_topk=None,
   ):
     # Unpack inputs if it's a tuple (e.g. from a previous layer returning (hidden_states, kv_cache))
     if isinstance(inputs, tuple):
@@ -375,7 +446,8 @@ class DeepSeekDenseLayer(DeepSeekGenericLayer):
       engram_output = self.engram_op(x, decoder_input_tokens)
       x = x + engram_output
 
-    hidden_states, intermediate_inputs = self.self_attention_with_norm_op(
+    indexer_kwargs = _indexer_kwargs(shared_indexer_mask, return_indexer_mask, forced_indexer_topk)
+    attention_outputs = self.self_attention_with_norm_op(
         x,
         decoder_segment_ids,
         decoder_positions,
@@ -383,7 +455,9 @@ class DeepSeekDenseLayer(DeepSeekGenericLayer):
         model_mode,
         previous_chunk,
         slot,
+        **indexer_kwargs,
     )
+    hidden_states, intermediate_inputs = attention_outputs[:2]
 
     if self.is_mhc_enabled:
       layer_output, _ = self.mhc_mlp(
@@ -398,7 +472,8 @@ class DeepSeekDenseLayer(DeepSeekGenericLayer):
       layer_output = mlp_lnx + intermediate_inputs
     layer_output = self.dropout_op(layer_output, deterministic=deterministic)
 
-    return self.post_process(layer_output, None, None, kv_cache)
+    outputs = self.post_process(layer_output, None, None, kv_cache)
+    return (*outputs, attention_outputs[2]) if return_indexer_mask else outputs
 
 
 DeepSeekDenseLayerToLinen = nnx_wrappers.to_linen_class(
@@ -422,8 +497,19 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
       rngs: nnx.Rngs,
       quant: Optional[quantizations.AqtQuantization] = None,
       layer_idx: int = -1,
+      use_hyper_connections: Optional[bool] = None,
+      has_indexer: Optional[bool] = None,
   ) -> None:
-    super().__init__(config, model_mode, mesh, rngs, quant, layer_idx)
+    super().__init__(
+        config,
+        model_mode,
+        mesh,
+        rngs,
+        quant,
+        layer_idx,
+        use_hyper_connections=use_hyper_connections,
+        has_indexer=has_indexer,
+    )
     self.DeepSeekMoeBlock_0 = moe.RoutedAndSharedMoE(
         config=self.config,
         mesh=mesh,
@@ -447,10 +533,16 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
       kv_cache=None,
       attention_metadata=None,
       decoder_input_tokens=None,
+      shared_indexer_mask=None,
+      return_indexer_mask: bool = False,
+      forced_routed_experts=None,
+      forced_indexer_topk=None,
   ):
     # Unpack inputs if it's a tuple (e.g. from a previous layer returning (hidden_states, kv_cache))
     if isinstance(inputs, tuple):
       inputs = inputs[0]
+    # Router replay ([batch, seq, top_k]); only reaches here with debug_forced_routing_deepseek (nnx_decoders.py).
+    moe_kwargs = {} if forced_routed_experts is None else {"forced_routed_experts": forced_routed_experts}
 
     # This code should only be traced during initialization when using
     # batch-split schedule. It is never run during model execution, since
@@ -591,7 +683,8 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
       engram_output = self.engram_op(x, decoder_input_tokens)
       x = x + engram_output
 
-    hidden_states, intermediate_inputs = self.self_attention_with_norm_op(
+    indexer_kwargs = _indexer_kwargs(shared_indexer_mask, return_indexer_mask, forced_indexer_topk)
+    attention_outputs = self.self_attention_with_norm_op(
         x,
         decoder_segment_ids,
         decoder_positions,
@@ -599,7 +692,9 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
         model_mode,
         previous_chunk,
         slot,
+        **indexer_kwargs,
     )
+    hidden_states, intermediate_inputs = attention_outputs[:2]
 
     if self.is_mhc_enabled:
       layer_output, metadata = self.mhc_mlp(
@@ -607,19 +702,22 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
           self.DeepSeekMoeBlock_0,
           x=intermediate_inputs,
           mhc_type=HyperConnectionType.MLP_MOE,
+          **moe_kwargs,
       )
       load_balance_loss = metadata["load_balance_loss"]
       moe_bias_updates = metadata["moe_bias_updates"]
     else:
-      mlp_lnx, load_balance_loss, moe_bias_updates = self.mlp_op(hidden_states, deterministic)
+      mlp_lnx, load_balance_loss, moe_bias_updates = self.mlp_op(hidden_states, deterministic, **moe_kwargs)
       layer_output = mlp_lnx + intermediate_inputs
     layer_output = self.dropout_op(layer_output, deterministic=deterministic)
 
-    return self.post_process(layer_output, load_balance_loss, moe_bias_updates, kv_cache)
+    outputs = self.post_process(layer_output, load_balance_loss, moe_bias_updates, kv_cache)
+    return (*outputs, attention_outputs[2]) if return_indexer_mask else outputs
 
-  def mlp_op(self, x, deterministic, *args, **kwargs):
+  def mlp_op(self, x, deterministic, *args, forced_routed_experts=None, **kwargs):
+    moe_kwargs = {} if forced_routed_experts is None else {"forced_routed_experts": forced_routed_experts}
     mlp_lnx, load_balance_loss, moe_bias_updates = self.DeepSeekMoeBlock_0(
-        x, intermediate_sharding=self.mlp_intermediate_sharding, out_sharding=self.out_sharding
+        x, intermediate_sharding=self.mlp_intermediate_sharding, out_sharding=self.out_sharding, **moe_kwargs
     )
     return self.with_logical_constraint(mlp_lnx), load_balance_loss, moe_bias_updates
 
@@ -628,3 +726,110 @@ DeepSeekMoELayerToLinen = nnx_wrappers.to_linen_class(
     DeepSeekMoELayer,
     base_metadata_fn=initializers.variable_to_logically_partitioned,
 )
+
+
+class DeepSeekIndexCacheMoEBlock(nnx.Module):
+  """`num_of_layers` consecutive DeepSeek MoE layers sharing one DSA top-k selection (IndexCache).
+
+  The first layer runs its own indexer; the following layers have none and attend with the first layer's top-k
+  mask. Hy4 groups its MoE layers as 1 indexer layer + (indexer_share_interval - 1) sharing layers. Scanning
+  these blocks keeps the mask inside one scan step, so no cross-layer carry is needed.
+  """
+
+  def __init__(
+      self,
+      config: Config,
+      model_mode: str,
+      mesh: Mesh,
+      rngs: nnx.Rngs,
+      quant: Optional[quantizations.AqtQuantization] = None,
+      layer_idx: int = -1,
+      num_of_layers: Optional[int] = None,
+      remat_policy_fn: Any = None,
+      apply_internal_remat: bool = False,
+  ) -> None:
+    self.config = config
+    self.num_of_layers = config.indexer_share_interval if num_of_layers is None else num_of_layers
+    self.remat_policy_fn = remat_policy_fn
+    self.apply_internal_remat = apply_internal_remat
+    for i in range(self.num_of_layers):
+      setattr(
+          self,
+          f"layers_{i}",
+          DeepSeekMoELayer(config, model_mode, mesh, rngs, quant, layer_idx, has_indexer=(i == 0)),
+      )
+
+  def __call__(
+      self,
+      inputs,
+      decoder_segment_ids,
+      decoder_positions,
+      deterministic,
+      model_mode,
+      previous_chunk=None,
+      slot: None | int = None,
+      kv_cache=None,
+      attention_metadata=None,
+      decoder_input_tokens=None,
+      forced_routed_experts=None,
+      forced_indexer_topk=None,
+  ):
+    """forced_routed_experts: router replay for the block's layers, [num_of_layers, batch, seq, top_k] (or None).
+
+    forced_indexer_topk: indexer top-k replay, [num_of_layers, batch, seq, indexer_topk]; only the first layer (the
+    one with the indexer) reads its slot.
+    """
+    if isinstance(inputs, tuple):
+      inputs = inputs[0]
+    if forced_routed_experts is not None and forced_routed_experts.shape[0] != self.num_of_layers:
+      raise ValueError(
+          f"forced_routed_experts leading axis {forced_routed_experts.shape[0]} != block layers {self.num_of_layers}"
+      )
+    y, indexer_mask = inputs, None
+    for i in range(self.num_of_layers):
+      layer = getattr(self, f"layers_{i}")
+      fre = None if forced_routed_experts is None else forced_routed_experts[i]
+
+      def run(layer, y, indexer_mask, fre, first=(i == 0)):
+        layer_args = (y, decoder_segment_ids, decoder_positions, deterministic, model_mode, previous_chunk, slot)
+        kw = {"decoder_input_tokens": decoder_input_tokens}
+        if fre is not None:
+          kw["forced_routed_experts"] = fre
+        if first and forced_indexer_topk is not None:
+          kw["forced_indexer_topk"] = forced_indexer_topk[0]
+        if first:
+          y, _, indexer_mask = layer(*layer_args, return_indexer_mask=True, **kw)
+        else:
+          y, _ = layer(*layer_args, shared_indexer_mask=indexer_mask, **kw)
+        return y, indexer_mask
+
+      if self.apply_internal_remat and self.config.remat_policy != "none":
+        y, indexer_mask = self._run_rematted(run, layer, y, indexer_mask, fre)
+      else:
+        y, indexer_mask = run(layer, y, indexer_mask, fre)
+    return y, None
+
+  def _run_rematted(self, run, layer, y, indexer_mask, fre=None):
+    """Runs one sub-layer behind its own remat boundary.
+
+    The block body unrolls its sub-layers, so XLA is free to issue every sub-layer's FSDP weight all-gathers
+    up front; on hy4-770b that kept three layers of gathered expert weights live and overflowed HBM, while the
+    same model scanned one layer at a time fit. Fencing the layer's state on its input pins each sub-layer's
+    gathers behind the previous sub-layer's output. The barrier is an identity, so the math is unchanged.
+    """
+    graphdef, state = nnx.split(layer)
+
+    def pure(state_in, y_in, mask_in, fre_in):
+      y_in, state_in = jax.lax.optimization_barrier((y_in, state_in))
+      merged = nnx.merge(graphdef, state_in)
+      y_out, mask_out = run(merged, y_in, mask_in, fre_in)
+      return y_out, mask_out, nnx.state(merged)
+
+    pure = jax.checkpoint(
+        pure,
+        policy=self.remat_policy_fn,
+        prevent_cse=maxtext_utils.should_prevent_cse_in_remat(self.config),
+    )
+    y, indexer_mask, new_state = pure(state, y, indexer_mask, fre)
+    nnx.update(layer, new_state)
+    return y, indexer_mask

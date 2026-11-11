@@ -64,21 +64,53 @@ from maxtext.common.common_types import (
 )
 
 from maxtext.layers.attentions import Attention
+from maxtext.layers.embeddings import YarnRotaryEmbedding
 from maxtext.layers.initializers import nd_dense_init, NdInitializer
 from maxtext.layers.linears import DenseGeneral
 from maxtext.layers.normalizations import RMSNorm
 from maxtext.layers.quantizations import AqtQuantization as Quant
 from maxtext.inference import kvcache
 from maxtext.inference.kvcache import KVQuant
+from maxtext.utils import accurate_math
 from maxtext.utils.sharding import create_sharding
 from maxtext.utils.globals import EPS
-
 
 PLACEHOLDER_SEQ_LEN = 1
 
 
 class indexer_losses(nnx.Variable):  # pylint: disable=invalid-name,abstract-method
   """Variable type for storing Indexer loss components -> bypasses nnx.Intermediate scan filters."""
+
+
+def kth_largest(x: Array, k: int) -> Array:
+  """Exact k-th largest value along the last axis, without sorting.
+
+  Maps x (float32 or bfloat16) to an order-preserving unsigned key of the same width and builds the answer bit by
+  bit from the MSB: a bit is kept when at least k elements are >= the candidate. One compare-and-count pass per key
+  bit (32 for float32, 16 for bfloat16) replaces a full sort. For NaN-free input the result equals
+  jax.lax.top_k(x, k)[0][..., -1] (the two zeros may differ in sign only, which compares equal); with NaNs the two
+  can differ, since positive NaNs order above +inf and negative ones below -inf here. Each pass reduces over the
+  whole last axis, so if that axis is sharded every pass is a cross-device reduction. Not differentiable: callers
+  only compare against the result.
+  """
+  if not 0 < k <= x.shape[-1]:
+    raise ValueError(f"kth_largest needs 0 < k <= {x.shape[-1]}, got k={k}.")
+  bits = jnp.finfo(x.dtype).bits
+  if bits not in (16, 32):
+    raise ValueError(f"kth_largest supports 16- and 32-bit floats, got {x.dtype}.")
+  sint, uint = (jnp.int16, jnp.uint16) if bits == 16 else (jnp.int32, jnp.uint32)
+  low, sign = (1 << (bits - 1)) - 1, 1 << (bits - 1)
+  i = jax.lax.bitcast_convert_type(jax.lax.stop_gradient(x), sint)
+  key = jax.lax.bitcast_convert_type(jnp.where(i < 0, i ^ sint(low), i), uint) ^ uint(sign)
+
+  def body(b, ans):
+    cand = ans | (uint(1) << (bits - 1 - b).astype(uint))
+    count = jnp.sum(key >= cand[..., None], axis=-1, dtype=jnp.int32)
+    return jnp.where(count >= k, cand, ans)
+
+  ans = jax.lax.fori_loop(0, bits, body, jnp.zeros(x.shape[:-1], uint))
+  signed = jax.lax.bitcast_convert_type(ans ^ uint(sign), sint)
+  return jax.lax.bitcast_convert_type(jnp.where(signed < 0, signed ^ sint(low), signed), x.dtype)
 
 
 class Indexer(nnx.Module):
@@ -156,7 +188,13 @@ class Indexer(nnx.Module):
     )
 
     # Key Normalization with Bias
-    self.k_norm = nnx.LayerNorm(num_features=self.head_dim, use_bias=True, dtype=self.weight_dtype, rngs=rngs)
+    self.k_norm = nnx.LayerNorm(
+        num_features=self.head_dim,
+        epsilon=getattr(config, "indexer_k_norm_epsilon", 1e-6),
+        use_bias=True,
+        dtype=self.weight_dtype,
+        rngs=rngs,
+    )
 
     # Projection: Input -> Importance Weights for Heads
     # deepseek3.2 enforces FP32 and does not quantize, for precision and stability.
@@ -169,7 +207,14 @@ class Indexer(nnx.Module):
         dtype=jnp.float32,
         weight_dtype=jnp.float32,
         quant=None,
-        matmul_precision=self.config.matmul_precision,
+        # indexer_fp32_scores: true FP32 product (Megatron-Core _dsa_weights_projection_fp32); default precision on TPU
+        # is one BF16 pass even for FP32 operands.
+        matmul_precision="highest"
+        if getattr(self.config, "indexer_fp32_scores", False)
+        else self.config.matmul_precision,
+        # indexer_weights_proj_bf16_weight: BF16 weight values, FP32 output (Megatron-Core _DSAWeightsProjection
+        # multiplies the BF16 model weight; the FP32 master weight is only in the optimizer).
+        kernel_round_dtype=jnp.bfloat16 if getattr(self.config, "indexer_weights_proj_bf16_weight", False) else None,
         shard_mode=self.config.shard_mode,
         rngs=self.rngs,
     )
@@ -207,8 +252,10 @@ class Indexer(nnx.Module):
     """Applies partial RoPE to the indexer query or key
 
     The Indexer's RoPE implementation differs from MLA's in two key aspects:
-    1. Split Order: Indexer splits the head dimension into [rope, nope], whereas MLA uses [nope, rope].
-    2. Input Layout: Indexer uses concatenated layout (interleave=False), whereas MLA uses interleaved (interleave=True).
+    1. Split Order: Indexer splits the head dimension into [rope, nope] (indexer_rope_position="first"; Hy4 uses
+       "last", i.e. [nope, rope] like MLA), whereas MLA uses [nope, rope].
+    2. Input Layout: set by indexer_rope_interleave, independent of MLA's rope_interleave (DeepSeek-V3.2: indexer
+       concatenated, MLA interleaved; Hy4-preview: both concatenated after checkpoint_rope_interleave conversion).
 
     Args:
       inputs: Input array of shape [batch, seqlen, indexer_n_heads, indexer_head_dim].
@@ -217,6 +264,11 @@ class Indexer(nnx.Module):
     Returns:
       Array with partial RoPE applied, with shape [batch, seqlen, indexer_n_heads, indexer_head_dim]
     """
+    if getattr(self.config, "indexer_rope_position", "first") == "last":
+      # Hy4: indexer_head_dim -> [indexer_head_dim - rope_head_dim, rope_head_dim]
+      x_nope, x_pe = jnp.split(inputs, [inputs.shape[-1] - self.rope_head_dim], axis=-1)
+      x_pe = self.rotary_embedding(x_pe, position=inputs_positions)
+      return jnp.concatenate([x_nope, x_pe], axis=-1)
     # indexer_head_dim -> [rope_head_dim, indexer_head_dim - rope_head_dim]
     x_pe, x_nope = jnp.split(inputs, [self.rope_head_dim], axis=-1)
     # x_pe [B, S, H, rope_head_dim], positions [B, S]
@@ -224,12 +276,14 @@ class Indexer(nnx.Module):
     x = jnp.concatenate([x_pe, x_nope], axis=-1)
     return x
 
-  def generate_mask(self, indexer_score: Array, topk_values: Array) -> Array:
+  def generate_mask(self, indexer_score: Array, topk_values: Array, k: Optional[int] = None) -> Array:
     """Creates a mask for top-k indices
 
     Args:
         indexer_score: [b, t, s] float - The computed relevance scores for all tokens.
-        topk_values: [b, t, k] float - The top-k selected score values from jax.lax.top_k.
+        topk_values: [b, t, k] float - The top-k selected score values from jax.lax.top_k; only the last one
+          (the cutoff) is read, so [b, t, 1] holding the k-th largest value works when k is given.
+        k: number of selected tokens; defaults to topk_values.shape[-1].
 
     Returns:
         mask: [b, t, s] - `0.0` for top-k selected elements, `DEFAULT_MASK_VALUE` elsewhere.
@@ -243,7 +297,7 @@ class Indexer(nnx.Module):
 
     if self.config.indexer_mask_exact_topk:
       # Prune ties by keeping only the first k unmasked tokens along sequence dimension
-      k = topk_values.shape[-1]
+      k = k if k is not None else topk_values.shape[-1]
       is_strictly_greater = indexer_score > indexer_cutoff_threshold
       is_equal = indexer_score == indexer_cutoff_threshold
 
@@ -309,7 +363,7 @@ class Indexer(nnx.Module):
     Returns:
       indexer_mask: A sparse mask [b, t, s] with 0.0 for top-k selected tokens
         and large negative values otherwise.
-      topk_indices: Indices of the top-k selected tokens [b, t, k].
+      topk_indices: Indices of the top-k selected tokens [b, t, k]; None when indexer_kth_select is on.
       indexer_score: The computed relevance scores [b, t, s].
 
     Notation:
@@ -409,7 +463,17 @@ class Indexer(nnx.Module):
       idx_score, _ = jax.lax.scan(jax.checkpoint(scan_body_indexer), init_score, {"q": q_h, "w": w_h})
       return idx_score.astype(q.dtype)
 
-    if head_chunk_size > 0:
+    if getattr(self.config, "indexer_fp32_scores", False):
+      # Megatron-Core _compute_index_scores: q and k upcast to FP32, q.k, ReLU, times the head weights and summed over
+      # heads, all in FP32 (true FP32 products; no BF16 rounding of the per-head logits).
+      if head_chunk_size > 0:
+        raise ValueError("indexer_fp32_scores does not support mla_qk_head_chunk_size > 0")
+      hi = jax.lax.Precision.HIGHEST
+      logits = jnp.einsum("bthd, bsd -> btsh", q.astype(jnp.float32), k.astype(jnp.float32), precision=hi)
+      logits = jax.nn.relu(logits)
+      indexer_score = jnp.einsum("btsh, bth -> bts", logits, weights.astype(jnp.float32), precision=hi)
+
+    elif head_chunk_size > 0:
       indexer_score = chunked_head_loop(head_chunk_size)
 
     else:
@@ -435,11 +499,14 @@ class Indexer(nnx.Module):
           k=self.indexer_topk,
           recall_target=self.config.indexer_approx_top_k_recall,
       )
+    elif self.config.indexer_kth_select:
+      # The mask only needs the k-th largest score; topk_indices is not computed.
+      topk_values, topk_indices = kth_largest(indexer_score, self.indexer_topk)[..., None], None
     else:
       topk_values, topk_indices = jax.lax.top_k(indexer_score, k=self.indexer_topk)  # [b, t, k]
 
     # Create Sparse Index Mask: 0 and large negatives
-    indexer_mask = self.generate_mask(indexer_score, topk_values)  # [b, t, s]
+    indexer_mask = self.generate_mask(indexer_score, topk_values, k=self.indexer_topk)  # [b, t, s]
 
     # Re-apply attention mask after TopK: in case number of unmasked tokens < TopK
     if attention_mask is not None:
@@ -519,6 +586,7 @@ class MLA(Attention):
       rope_factor: float = 40.0,  # rotary embedding factor
       name: str | None = None,
       rngs: Optional[nnx.Rngs] = None,
+      has_indexer: Optional[bool] = None,
   ):
     """Initializes the MLA module.
 
@@ -596,14 +664,19 @@ class MLA(Attention):
         rngs=rngs,
     )
 
-    # Initialize Indexer
+    # Initialize Indexer. With DSA on (use_indexer), a layer either runs its own indexer or, when built with
+    # has_indexer=False, reuses the top-k mask of a preceding layer passed in as `shared_indexer_mask` (IndexCache).
     self.use_indexer = config.use_indexer
-    if self.use_indexer:
+    self.has_indexer = self.use_indexer and (has_indexer is None or has_indexer)
+    if self.has_indexer:
       # Need two versions of rope.
-      # MLA applies yarn with interleave layout.
-      # Indexer applies yarn with concatenate layout.
+      # MLA applies yarn with the rope_interleave layout.
+      # Indexer applies yarn with the indexer_rope_interleave layout (DeepSeek-V3.2: concatenated; Hy4-preview:
+      # concatenated, like its MLA, after checkpoint_rope_interleave conversion).
+      if config.indexer_rope_interleave and not isinstance(self.rotary_embedding, YarnRotaryEmbedding):
+        raise ValueError("indexer_rope_interleave=True requires rope_type='yarn'.")
       indexer_rope = copy.copy(self.rotary_embedding)
-      indexer_rope.interleave = False
+      indexer_rope.interleave = config.indexer_rope_interleave
       self.indexer = Indexer(
           config,
           rngs=rngs,
@@ -672,6 +745,7 @@ class MLA(Attention):
           weight_dtype=self.weight_dtype,
           quant=self.quant,
           matmul_precision=self.config.matmul_precision,
+          fp32_accumulation=getattr(self.config, "dense_fp32_accumulation", False),
           shard_mode=self.config.shard_mode,
           rngs=self.rngs,
       )
@@ -687,6 +761,7 @@ class MLA(Attention):
           weight_dtype=self.weight_dtype,
           quant=self.quant,
           matmul_precision=self.config.matmul_precision,
+          fp32_accumulation=getattr(self.config, "dense_fp32_accumulation", False),
           shard_mode=self.config.shard_mode,
           rngs=self.rngs,
       )
@@ -694,8 +769,11 @@ class MLA(Attention):
           num_features=self.q_lora_rank,
           dtype=self.config.dtype,
           weight_dtype=self.config.weight_dtype,
-          epsilon=self.config.normalization_layer_epsilon,
+          epsilon=self._lora_norm_epsilon(),
           kernel_axes=("norm",),
+          single_rounding=getattr(self.config, "rmsnorm_single_rounding", False),
+          scale_grad_fp32=getattr(self.config, "rmsnorm_scale_grad_fp32", False),
+          scale_grad_gpu_order=getattr(self.config, "rmsnorm_scale_grad_gpu_order", False),
           rngs=self.rngs,
       )
       self.wq_b = DenseGeneral(
@@ -708,6 +786,7 @@ class MLA(Attention):
           weight_dtype=self.weight_dtype,
           quant=self.quant,
           matmul_precision=self.config.matmul_precision,
+          fp32_accumulation=getattr(self.config, "dense_fp32_accumulation", False),
           shard_mode=self.config.shard_mode,
           rngs=self.rngs,
       )
@@ -723,6 +802,7 @@ class MLA(Attention):
         weight_dtype=self.weight_dtype,
         quant=self.quant,
         matmul_precision=self.config.matmul_precision,
+        fp32_accumulation=getattr(self.config, "dense_fp32_accumulation", False),
         shard_mode=self.config.shard_mode,
         rngs=self.rngs,
     )
@@ -730,8 +810,11 @@ class MLA(Attention):
         num_features=self.kv_lora_rank,
         dtype=self.config.dtype,
         weight_dtype=self.config.weight_dtype,
-        epsilon=self.config.normalization_layer_epsilon,
+        epsilon=self._lora_norm_epsilon(),
         kernel_axes=("norm",),
+        single_rounding=getattr(self.config, "rmsnorm_single_rounding", False),
+        scale_grad_fp32=getattr(self.config, "rmsnorm_scale_grad_fp32", False),
+        scale_grad_gpu_order=getattr(self.config, "rmsnorm_scale_grad_gpu_order", False),
         rngs=self.rngs,
     )
     self.wkv_b = DenseGeneral(
@@ -747,6 +830,7 @@ class MLA(Attention):
         weight_dtype=self.weight_dtype,
         quant=self.quant,
         matmul_precision=self.config.matmul_precision,
+        fp32_accumulation=getattr(self.config, "dense_fp32_accumulation", False),
         shard_mode=self.config.shard_mode,
         rngs=self.rngs,
     )
@@ -758,6 +842,28 @@ class MLA(Attention):
       self.softmax_scale = self.softmax_scale * mscale * mscale
 
     self.out = self.init_out_w(output_dim=inputs_q_shape[-1])
+
+    if self.config.attention_output_gate == "elementwise":
+      self.gate_proj = DenseGeneral(
+          in_features_shape=self.config.emb_dim,
+          out_features_shape=(self.num_query_heads, self.v_head_dim),
+          axis=-1,
+          kernel_init=self.kernel_init,
+          kernel_axes=("embed_attn", "q_heads", "kv"),
+          dtype=self.dtype,
+          weight_dtype=self.weight_dtype,
+          quant=self.quant,
+          matmul_precision=self.config.matmul_precision,
+          fp32_accumulation=getattr(self.config, "dense_fp32_accumulation", False),
+          shard_mode=self.config.shard_mode,
+          rngs=self.rngs,
+      )
+    else:
+      self.gate_proj = None
+
+  def _lora_norm_epsilon(self) -> float:
+    eps = self.config.mla_lora_norm_epsilon
+    return self.config.normalization_layer_epsilon if eps < 0 else eps
 
   def _attention_op_num_kv_heads(self) -> int:
     if self.use_absorbed_mqa:
@@ -1037,6 +1143,7 @@ class MLA(Attention):
       indexer_mask: Array,
       sparse_loss: bool,
       scaling_factor: float,
+      debug_sow: bool = False,
   ) -> Array:
     """Calculates the indexer KL divergence loss.
 
@@ -1075,7 +1182,9 @@ class MLA(Attention):
     # Ensure indexer_score updates identically in all branches
     if sparse_loss:
       indexer_score = indexer_score + indexer_mask
-    indexer_probs = jax.nn.softmax(indexer_score.astype(jnp.float32), axis=-1)
+    acc = getattr(self.config, "transcendental_accuracy_highest", False)  # FP32 exp / log at accuracy=HIGHEST
+    acc_log = accurate_math.log_mode(self.config, acc)  # the log sites: "freebsd" under transcendental_log_freebsd
+    indexer_probs = accurate_math.softmax(indexer_score.astype(jnp.float32), axis=-1, accurate=acc)
 
     batch, q_len, heads, dim = query.shape
     # is_1_kv_head is True when:
@@ -1128,7 +1237,7 @@ class MLA(Attention):
         elif attention_mask is not None:
           attn_chunk = attn_chunk + attention_mask[:, None, :, :]
 
-        probs_chunk = jax.nn.softmax(attn_chunk.astype(jnp.float32), axis=-1)
+        probs_chunk = accurate_math.softmax(attn_chunk.astype(jnp.float32), axis=-1, accurate=acc)
         probs_chunk_sum = jnp.sum(probs_chunk, axis=1)  # [b, t, s]
 
         return carry + probs_chunk_sum, None
@@ -1138,36 +1247,111 @@ class MLA(Attention):
 
     else:
       # Native implementation (default) if chunking is disabled
+      if getattr(self.config, "indexer_fp32_scores", False):
+        # Megatron-Core compute_dsa_indexer_loss: torch.bmm(query.float(), key.float()), a true FP32 teacher q.k.
+        query = query.astype(jnp.float32)
+        key = key.astype(jnp.float32)
+      teacher_precision = (
+          jax.lax.Precision.HIGHEST
+          if getattr(self.config, "indexer_fp32_scores", False)
+          else self.config.matmul_precision
+      )
       if is_1_kv_head:
         attention_scores = jnp.einsum(
             "bthd, bsd -> bhts",
             query,
             key.squeeze(2),
-            precision=self.config.matmul_precision,
+            precision=teacher_precision,
         )
       else:
         attention_scores = jnp.einsum(
             "bthd, bshd -> bhts",
             query,
             key,
-            precision=self.config.matmul_precision,
+            precision=teacher_precision,
         )
       if sparse_loss:
         attention_scores = attention_scores + indexer_mask[:, None, :, :]
       elif attention_mask is not None:
         attention_scores = attention_scores + attention_mask[:, None, :, :]
-      attention_probs = jnp.sum(jax.nn.softmax(attention_scores.astype(jnp.float32), axis=-1), axis=1)
+      attention_probs = jnp.sum(
+          accurate_math.softmax(attention_scores.astype(jnp.float32), axis=-1, accurate=acc), axis=1
+      )
       attention_probs = jax.lax.optimization_barrier(attention_probs)
-    # L1 normalize aggregated target distribution
-    attention_probs = attention_probs / (jnp.sum(attention_probs, axis=-1, keepdims=True) + EPS)
+    if getattr(self.config, "indexer_kd_mcore_log", False):
+      # Megatron-Core (dsa_indexer_loss): L1 normalization with a 1e-10 clamp, exact log_softmax for the indexer,
+      # log(max(p, 1e-10)) for the target, and terms with p == 0 left out.
+      attention_probs = attention_probs / jnp.maximum(jnp.sum(attention_probs, axis=-1, keepdims=True), 1e-10)
+      log_indexer_probs = accurate_math.log_softmax(indexer_score.astype(jnp.float32), axis=-1, accurate=acc_log)
+      log_attention_probs = accurate_math.log(jnp.maximum(attention_probs, 1e-10),acc_log)
+      nonzero = attention_probs > 0
+      kl_per_token = jnp.where(
+          nonzero, attention_probs * (log_attention_probs - jnp.where(nonzero, log_indexer_probs, 0.0)), 0.0
+      )
+    else:
+      # L1 normalize aggregated target distribution
+      attention_probs = attention_probs / (jnp.sum(attention_probs, axis=-1, keepdims=True) + EPS)
 
-    # KL Divergence: KL(attention || indexer)
-    log_attention_probs = jnp.log(attention_probs + EPS)
-    log_indexer_probs = jnp.log(indexer_probs + EPS)
-    kl_per_token = attention_probs * (log_attention_probs - log_indexer_probs)
+      # KL Divergence: KL(attention || indexer)
+      log_attention_probs = accurate_math.log(attention_probs + EPS,acc_log)
+      log_indexer_probs = accurate_math.log(indexer_probs + EPS,acc_log)
+      kl_per_token = attention_probs * (log_attention_probs - log_indexer_probs)
     indexer_loss = jnp.mean(jnp.sum(kl_per_token, axis=-1))
+    if getattr(self.config, "indexer_kd_generalized_kl", False):
+      # Recorded value only: the generalized KL sum(p log(p/q) - p + q), written per element as p (expm1(r) - r) with
+      # r = log q - log p (and q where p == 0). It equals the KL for normalized p and q, but is first-order insensitive
+      # to sum(p) != 1 and to a uniform shift of log q, which in FP32 on TPU are ~1e-8 and, against a KL of ~1e-4 per
+      # row, bias the recorded KL up by ~1e-4 relative; expm1(r) - r avoids the cancellation of -p + q in FP32.
+      # Gradients stay those of the KL above (the difference goes through stop_gradient).
+      mcore = getattr(self.config, "indexer_kd_mcore_log", False)
+      nz = attention_probs > 0
+      log_p = accurate_math.log(jnp.where(nz, attention_probs, 1.0),acc_log)  # unclipped: p < 1e-10 still adds q - p
+      r = jnp.where(nz, log_indexer_probs - log_p, 0.0)
+      q_all = accurate_math.exp(log_indexer_probs, acc) if mcore else indexer_probs  # masked positions are 0
+      # expm1(r) - r: a short series where |r| < 0.05 (truncation < 2e-10 relative) so that a bias in expm1 is not
+      # amplified by the cancellation against r; expm1 elsewhere.
+      r_s = jnp.where(jnp.abs(r) < 0.05, r, 0.0)
+      series = r_s * r_s * (0.5 + r_s * (1.0 / 6 + r_s * (1.0 / 24 + r_s * (1.0 / 120 + r_s * (1.0 / 720)))))
+      f = jnp.where(jnp.abs(r) < 0.05, series, accurate_math.expm1(r, acc) - r)
+      gen = jnp.where(nz, attention_probs * f, q_all)
+      gen_loss = jnp.mean(jnp.sum(gen, axis=-1))
+      indexer_loss = indexer_loss + jax.lax.stop_gradient(gen_loss - indexer_loss)
+    if debug_sow:  # diagnostics only (debug_sow_indexer): the teacher target, the indexer log-probs and the per-row KL
+      self.sow(nnx.Intermediate, "debug_kd_target", attention_probs)
+      self.sow(nnx.Intermediate, "debug_kd_log_indexer", log_indexer_probs)
+      self.sow(nnx.Intermediate, "debug_kd_kl_rows", jnp.sum(kl_per_token, axis=-1))
 
     return indexer_loss * scaling_factor
+
+  def _forced_indexer_mask(self, forced_topk: Array, own_mask: Optional[Array], attention_mask: Optional[Array]) -> Array:
+    """debug_forced_indexer_topk: the indexer mask built from given key positions instead of this layer's top-k.
+
+    forced_topk: [b, t, k] key positions (-1 or out of range = unused). Sows forced_indexer_index_sum ([b, t], the sum
+    of the selected positions per query) and forced_indexer_natural_agree / forced_indexer_natural_overlap (queries
+    whose own top-k set is the same; the share of the given positions the layer would select itself).
+    """
+    b, t = forced_topk.shape[:2]
+    s = own_mask.shape[-1] if own_mask is not None else (attention_mask.shape[-1] if attention_mask is not None else t)
+    idx = forced_topk.astype(jnp.int32)
+    idx = jnp.where((idx >= 0) & (idx < s), idx, s)
+    sel = jnp.zeros((b, t, s), jnp.bool_)
+    sel = sel.at[jnp.arange(b)[:, None, None], jnp.arange(t)[None, :, None], idx].set(True, mode="drop")
+    mask = jnp.where(sel, 0.0, DEFAULT_MASK_VALUE).astype(self.dtype)
+    if attention_mask is not None:
+      mask = mask + attention_mask
+    if own_mask is not None:
+      mask = mask.astype(own_mask.dtype)
+      own = own_mask > DEFAULT_MASK_VALUE / 2
+      agree = jnp.mean(jnp.all(own == sel, axis=-1).astype(jnp.float32))
+      self.sow(nnx.Intermediate, "forced_indexer_natural_agree", agree)
+      self.sow(
+          nnx.Intermediate,
+          "forced_indexer_natural_overlap",
+          jnp.sum(own & sel).astype(jnp.float32) / jnp.maximum(jnp.sum(sel).astype(jnp.float32), 1.0),
+      )
+    pos = jnp.arange(s, dtype=jnp.int32)
+    self.sow(nnx.Intermediate, "forced_indexer_index_sum", jnp.sum(jnp.where(sel, pos, 0), axis=-1, dtype=jnp.int32))
+    return mask
 
   def __call__(
       self,
@@ -1185,8 +1369,14 @@ class MLA(Attention):
       rope_kwargs: dict | None = None,
       kv_cache: Optional[Array] = None,
       attention_metadata: Optional[dict[str, Any]] = None,
-  ) -> tuple[Array, Optional[Array]]:
+      shared_indexer_mask: Optional[Array] = None,
+      return_indexer_mask: bool = False,
+      forced_indexer_topk: Optional[Array] = None,
+  ) -> tuple[Array, Optional[Array]] | tuple[Array, Optional[Array], Optional[Array]]:
     """Forward pass for MLA, reusing `AttentionOp` for the actual attention.
+
+    With DSA, `shared_indexer_mask` is the top-k mask a layer built with has_indexer=False uses, and
+    `return_indexer_mask=True` appends this layer's mask to the outputs so later layers can reuse it.
 
     Args:
       inputs_q: Query input [batch, q_length, embed_dim].
@@ -1229,7 +1419,12 @@ class MLA(Attention):
 
     # Indexer Logic
     indexer_mask = None
-    if self.use_indexer:
+    if self.use_indexer and not self.has_indexer:
+      # None is valid: the indexer layer selects every token (no mask) when the sequence fits in indexer_topk.
+      if model_mode != MODEL_MODE_TRAIN:
+        raise NotImplementedError("Shared DSA indexer masks (IndexCache) are only implemented for training.")
+      indexer_mask = shared_indexer_mask
+    elif self.use_indexer:
       # generate mask: with 0 and large negative, [b, 1, 1, q_len, kv_len] -> [b, q_len, kv_len]
       attention_mask = self.attention_op.generate_attention_mask(
           query,
@@ -1243,7 +1438,7 @@ class MLA(Attention):
       if attention_mask is not None:
         attention_mask = attention_mask.squeeze(axis=(1, 2))
       # apply indexer, indexer_mask [b, q_len, kv_len]
-      indexer_mask, _, indexer_score = self.indexer(
+      indexer_mask, indexer_topk_idx, indexer_score = self.indexer(
           inputs_q=inputs_q,
           low_rank_q=low_rank_q,
           inputs_kv=inputs_kv,
@@ -1254,7 +1449,40 @@ class MLA(Attention):
           kv_cache=self.IndexerKVCache_0,
           model_mode=model_mode,
       )
+      if forced_indexer_topk is not None:
+        indexer_mask = self._forced_indexer_mask(forced_indexer_topk, indexer_mask, attention_mask)
+      elif getattr(self.config, "debug_capture_choices", False) and indexer_mask is not None:
+        # debug_capture_choices: this layer's own top-k key positions, -1 where the position is masked
+        idx = indexer_topk_idx
+        if idx is None:  # indexer_kth_select computes no indices
+          _, idx = jax.lax.top_k(indexer_score, k=self.indexer.indexer_topk)
+        picked = jnp.take_along_axis(indexer_mask, idx, axis=-1)
+        idx = jnp.where(picked > DEFAULT_MASK_VALUE / 2, idx, -1).astype(jnp.int32)
+        self.sow(nnx.Intermediate, "captured_indexer_topk", idx)
 
+      if getattr(self.config, "debug_sow_indexer", False) and indexer_mask is not None:
+        # Diagnostics only (default off): the first batch row of the KD teacher / student inputs, sowed as
+        # Intermediates so a forward-only call can compare them tensor by tensor with another implementation.
+        self.sow(nnx.Intermediate, "debug_kd_query", query[0:1])
+        self.sow(nnx.Intermediate, "debug_kd_key", key[0:1])
+        self.sow(nnx.Intermediate, "debug_kd_indexer_score", indexer_score[0:1])
+        self.sow(nnx.Intermediate, "debug_kd_indexer_mask", indexer_mask[0:1])
+        if self.config.indexer_loss_scaling_factor > 0.0:
+          # the in-graph KD of that same row, so the formula can be checked on its own inputs
+          self.sow(
+              nnx.Intermediate,
+              "debug_kd_loss_row0",
+              self.calculate_indexer_loss(
+                  indexer_score=indexer_score[0:1],
+                  query=query[0:1],
+                  key=key[0:1],
+                  attention_mask=None if attention_mask is None else attention_mask[0:1],
+                  indexer_mask=indexer_mask[0:1],
+                  sparse_loss=self.config.indexer_sparse_training,
+                  scaling_factor=1.0,
+                  debug_sow=True,
+              ),
+          )
       if indexer_mask is not None and self.config.indexer_loss_scaling_factor > 0.0:
         indexer_loss = self.calculate_indexer_loss(
             indexer_score=indexer_score,
@@ -1278,6 +1506,7 @@ class MLA(Attention):
         inputs_positions,
         model_mode,
         cached_values,
+        sinks=self.sinks,
         indexer_mask=indexer_mask,
         record_max_logits=use_qk_clip,
     )
@@ -1286,9 +1515,22 @@ class MLA(Attention):
       out = self.absorb_output(out)
 
     out = self._maybe_shard_with_logical(out, self.out_axis_names)
+    # Named before the output gate so that a remat policy saving attention_out keeps the kernel output that the
+    # gate's backward needs; the gate itself is a cheap elementwise op.
     out = jax.ad_checkpoint.checkpoint_name(out, "attention_out")
+
+    if self.gate_proj is not None:
+      # [batch, length, heads, v_head_dim]; the gate reads the attention input, not the attention output.
+      gate = self.gate_proj(inputs_q, out_sharding=create_sharding(self.mesh, self.out_axis_names))
+      # Named so a remat policy can keep it: without it the rematted forward recomputes the [emb -> heads x v_head_dim]
+      # projection only to rebuild the sigmoid gate. (The backward still needs the full weight for dX.)
+      gate = checkpoint_name(gate, "attention_gate")
+      acc = accurate_math.site_on(self.config, "sigmoid_attn_gate")
+      out = out * accurate_math.sigmoid(gate.astype(jnp.float32), acc).astype(out.dtype)
 
     out_sharding = create_sharding(self.mesh, out_logical_name)
     out = self.out_projection(out, out_sharding=out_sharding)
     out = checkpoint_name(out, "out_proj")
+    if return_indexer_mask:
+      return out, kv_cache, indexer_mask
     return out, kv_cache

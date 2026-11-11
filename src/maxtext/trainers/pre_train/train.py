@@ -75,6 +75,7 @@ from maxtext.common.metric_logger import record_activation_metrics
 from maxtext.utils import exceptions
 from maxtext.utils import gcs_utils
 from maxtext.utils import max_logging
+from maxtext.utils import accurate_math
 from maxtext.utils import max_utils
 from maxtext.utils import maxtext_utils
 from maxtext.utils import qk_clip_utils
@@ -110,6 +111,20 @@ def get_first_step(model, state):
 # -----------------------------------------------------------------------------
 # Top-level Functions
 # -----------------------------------------------------------------------------
+
+
+def indexer_kd_mcore_term(indexer_loss, num_rows, total_weights, manual_gradient_accumulation):
+  """Indexer KL term weighted as Megatron-Core does with calculate_per_token_loss (indexer_kd_mcore_weight).
+
+  `indexer_loss` is a mean over the microbatch's query rows. Megatron-Core sums the per-row KL over every row and divides
+  by the global valid-token count, so the weight is the number of rows, not this microbatch's valid tokens (they
+  differ when the loss mask drops tokens, e.g. eod). Under manual gradient accumulation the objective is divided by the
+  global token count later; otherwise the loss here is already per token of this microbatch.
+  """
+  rows = jnp.asarray(num_rows, jnp.float32)
+  if manual_gradient_accumulation:
+    return indexer_loss * rows
+  return indexer_loss * rows / (jnp.asarray(total_weights, jnp.float32) + EPS)
 
 
 def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_train=True):
@@ -156,6 +171,8 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
   forced_routing_kwargs = (
       {"forced_routed_experts": data["forced_routed_experts"]} if "forced_routed_experts" in data else {}
   )
+  if "forced_indexer_topk" in data:  # debug_forced_indexer_topk: DSA indexer top-k replay
+    forced_routing_kwargs["forced_indexer_topk"] = data["forced_indexer_topk"]
 
   if is_block_diffusion:
     targets_loss_mask = (data["targets_loss_mask"] != 0) & (data["targets_segmentation"] != 0)
@@ -237,7 +254,12 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
           data["targets_segmentation"] != 0,
       )
     one_hot_targets = jax.nn.one_hot(data["targets"], config.vocab_size)
-    xent, z_loss = max_utils.cross_entropy_with_logits(logits, one_hot_targets, z_loss=config.z_loss_multiplier)
+    xent, z_loss = max_utils.cross_entropy_with_logits(
+        logits,
+        one_hot_targets,
+        z_loss=config.z_loss_multiplier,
+        accurate=accurate_math.log_mode(config, getattr(config, "transcendental_accuracy_highest", False)),
+    )
 
     xent = sharding.maybe_shard_with_logical(
         xent,
@@ -311,13 +333,22 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
 
   # Calculate and add auxiliary Indexer loss
   indexer_loss = 0.0
+  indexer_loss_per_layer = None
   if config.use_indexer and config.indexer_loss_scaling_factor > 0.0:
     # Recursively collect per-layer indexer losses across all scanned transformer layers.
     indexer_losses_list = maxtext_utils.collect_intermediates_by_suffix(intermediate_outputs, "indexer_loss")
     if indexer_losses_list:
-      indexer_loss = jnp.mean(jnp.concatenate([jnp.atleast_1d(x) for x in indexer_losses_list]))
+      per_layer = jnp.concatenate([jnp.atleast_1d(x) for x in indexer_losses_list])
+      indexer_loss = jnp.mean(per_layer)
+      if getattr(config, "log_indexer_loss_per_layer", False):
+        indexer_loss_per_layer = per_layer
       # Injects loss into scalar objective to drive backward gradients for indexer weights.
-      loss = _add_aux_loss(loss, indexer_loss)
+      if config.indexer_kd_mcore_weight:
+        loss = loss + indexer_kd_mcore_term(
+            indexer_loss, data["targets"].size, total_weights, manual_gradient_accumulation and is_train
+        )
+      else:
+        loss = _add_aux_loss(loss, indexer_loss)
     else:
       max_logging.debug("No Indexer loss found. Defaulting to 0.0.")
 
@@ -370,6 +401,9 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
       "mtp_loss": mtp_loss,
       "batch_stats": (intermediate_outputs.get("batch_stats", None) if hasattr(intermediate_outputs, "get") else None),
   }
+  if indexer_loss_per_layer is not None:
+    aux["indexer_loss_per_layer"] = indexer_loss_per_layer
+
   te_moe_block = getattr(config, "te_moe_block", False)
   if te_moe_block:
     overflow_values = maxtext_utils.collect_intermediates_by_suffix(intermediate_outputs, "te_moe_capacity_overflow")
@@ -413,6 +447,31 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
       aux["moe_max_load_ratio"] = jnp.max(load_ratios)
       aux["moe_max_load_ratio_mean"] = jnp.mean(load_ratios)
   return loss, aux
+
+
+def no_dropless_retry(config):
+  """True when moe_dropless_fallback='step' runs without a dropless program (moe_dropless_retry=False)."""
+  return config.moe_dropless_fallback == "step" and not getattr(config, "moe_dropless_retry", True)
+
+
+def raise_on_moe_overflow(step, config, checkpoint_manager, prof):
+  """Stops training on a MoE ragged buffer overflow when there is no dropless program (moe_dropless_retry=False).
+
+  Called right after the train step, before the step's state is checkpointed or used again. Like the TE overflow
+  stop, it closes the profiler window and logs the error; it also lets an earlier step's async checkpoint finish.
+  """
+  prof.deactivate()
+  if checkpoint_manager is not None:
+    checkpointing.wait_until_finished(checkpoint_manager)
+  message = (
+      f"MoE ragged buffer overflow at training step {step} (ragged_buffer_factor={config.ragged_buffer_factor}):"
+      " tokens would be dropped, and moe_dropless_retry=False builds no dropless program to replay the step."
+      " The step's update is discarded and not checkpointed. Increase ragged_buffer_factor"
+      " (log_required_ragged_buffer_factor=True logs the factor each step needs), or set"
+      " moe_dropless_retry=True if the dropless program fits in HBM."
+  )
+  max_logging.error(message)
+  raise RuntimeError(message)
 
 
 def _rollback_on_overflow(new_state, old_leaves, has_moe_overflow):
@@ -463,6 +522,13 @@ def step_diagnostics(raw_grads, has_moe_overflow, bias_values, bias_updates):
   }
 
 
+def _maybe_zero_mean_bias_update(update, config):
+  """routed_bias_zero_mean_update: remove the mean over the expert (last) axis from a routed-bias update."""
+  if not config.routed_bias_zero_mean_update:
+    return update
+  return update - jnp.mean(update, axis=-1, keepdims=True)
+
+
 def _find_gate_bias(module: nnx.Module | None) -> nnx.Variable | None:
   """Finds the router gate bias parameter in a module graph."""
   if module is None:
@@ -492,7 +558,10 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   del dropout_rng  # unused for NNX (kept for jit signature parity)
   # pylint: disable=too-many-nested-blocks
   # --- Per-path initialization ---
-  input_state_leaves = jax.tree_util.tree_leaves(state) if config.moe_dropless_fallback == "step" else None
+  # The in-graph rollback keeps the pre-step state for the dropless replay; without a replay
+  # (moe_dropless_retry=False) the host stops before the updated state is used or checkpointed.
+  rollback = config.moe_dropless_fallback == "step" and getattr(config, "moe_dropless_retry", True)
+  input_state_leaves = jax.tree_util.tree_leaves(state) if rollback else None
   state = nnx.merge(model, state)  # reconstruct TrainStateNNX
   loss_model, loss_params, loss_rng = state.model, None, None
 
@@ -619,8 +688,11 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   # Apply updates for Auxiliary-Loss-Free load balancing for DeepSeek family
   # pylint: disable=too-many-nested-blocks
   if config.routed_bias and config.routed_bias_update_rate > 0.0:
-    if getattr(config, "model_name", "").startswith("deepseek4"):
-      max_logging.log("DeepSeek V4: Applying auxiliary-loss-free routing bias via pure NNX MoEBiasVar.")
+    # DeepSeek V4 and IndexCache stacks hold several gate biases per stack, so match each update to its gate by path.
+    if getattr(config, "model_name", "").startswith("deepseek4") or (
+        config.use_indexer and config.indexer_share_interval > 1
+    ):
+      max_logging.log("Applying auxiliary-loss-free routing bias updates by intermediate path.")
       flat_intermediates = traverse_util.flatten_dict(aux.get("intermediate_outputs", {}))
       for path, update in flat_intermediates.items():
         if path[-1] != "moe_bias_updates":
@@ -640,6 +712,7 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
         for _, node in nnx.iter_graph(target):
           if type(node).__name__ == "GateLogit" and hasattr(node, "bias") and node.bias is not None:
             update_val = update[0] if isinstance(update, (tuple, list)) else update
+            update_val = _maybe_zero_mean_bias_update(jnp.array(update_val), config)
             name_prefix = "-".join(map(str, prefix))
             if getattr(config, "log_moe_bias_norms", False):
               bias_metrics[f"learning/moe_bias_before_norm_{name_prefix}"] = jnp.linalg.norm(node.bias.value)
@@ -654,7 +727,7 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       decoder_layer = getattr(new_state.model.decoder, "moe_layers", new_state.model.decoder)
       decoder_bias = _find_gate_bias(decoder_layer)
       if decoder_bias is not None and moe_bias_updates is not None:
-        decoder_update = jnp.array(moe_bias_updates[0])
+        decoder_update = _maybe_zero_mean_bias_update(jnp.array(moe_bias_updates[0]), config)
         decoder_bias.value = decoder_bias.value + decoder_update
         diag_bias_values.append(decoder_bias.value)
         diag_bias_updates.append(decoder_update)
@@ -667,7 +740,7 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
           mtp_layer = getattr(new_state.model.mtp_block, f"mtp_layer_{i + 1}", None)
           mtp_bias = _find_gate_bias(mtp_layer)
           if mtp_bias is not None:
-            mtp_update = jnp.array(update)
+            mtp_update = _maybe_zero_mean_bias_update(jnp.array(update), config)
             mtp_bias.value = mtp_bias.value + mtp_update
             diag_bias_values.append(mtp_bias.value)
             diag_bias_updates.append(mtp_update)
@@ -683,6 +756,9 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       "learning/mtp_loss": mtp_loss,
       "learning/total_weights": total_weights,
   }
+  if aux.get("indexer_loss_per_layer") is not None:
+    for i in range(aux["indexer_loss_per_layer"].shape[0]):
+      scalar_metrics[f"learning/indexer_loss_layer_{i}"] = aux["indexer_loss_per_layer"][i]
   if getattr(config, "te_moe_block", False):
     scalar_metrics.update(
         {
@@ -697,7 +773,12 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
     scalar_metrics["learning/moe_max_load_ratio"] = aux["moe_max_load_ratio"]
     scalar_metrics["learning/moe_max_load_ratio_mean"] = aux["moe_max_load_ratio_mean"]
   scalar_metrics.update(bias_metrics)
+  qk_clip_per_head = None
   if config.use_qk_clip:
+    if getattr(config, "qk_clip_log_per_head", False):
+      qk_clip_per_head = qk_clip_utils.per_head_stats(
+          nnx.state(new_state.model, nnx.Param).to_pure_dict(), intermediate_outputs, config
+      )
     new_state = qk_clip_utils.apply_qk_clip_nnx(new_state, intermediate_outputs, config)
 
     global_max_logit = qk_clip_utils.calculate_max_logit_metric(intermediate_outputs)
@@ -732,6 +813,9 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
     metrics["has_moe_overflow"] = (  # pyrefly: ignore[bad-assignment]
         has_moe_overflow if has_moe_overflow is not None else jnp.bool_(False)  # pyrefly: ignore[bad-assignment]
     )
+  if qk_clip_per_head is not None:
+    # Top-level (not "scalar"): per-(layer,) head arrays, read by drivers that log them (qk_clip_log_per_head).
+    metrics["qk_clip_per_head"] = qk_clip_per_head  # pyrefly: ignore[bad-assignment]
   if getattr(config, "log_required_ragged_buffer_factor", False) and "moe_required_rbf" in aux:
     # Top-level (not "scalar"): a per-layer vector, read by training_loop_iteration for the REQUIRED_RBF line.
     metrics["moe_required_rbf"] = aux["moe_required_rbf"]  # pyrefly: ignore[bad-assignment]
@@ -883,6 +967,8 @@ def training_loop_iteration(
             # The attempt rolled its update back, so `state` is still the pre-step state.
             state, metrics = p_train_step_dropless(state, example_batch, *step_rng_args)
             _maybe_log_required_rbf(config, step, metrics, "dropless")
+          elif no_dropless_retry(config) and bool(metrics.get("has_moe_overflow")):
+            raise_on_moe_overflow(step, config, checkpoint_manager, prof)
 
   step_time_delta = datetime.datetime.now() - last_step_completion
   last_step_completion = datetime.datetime.now()
@@ -937,6 +1023,12 @@ def training_loop_iteration(
               f"Replaying eval step with dropless buffer..."
           )
           eval_metrics = p_eval_step_dropless(state, eval_batch, *step_rng_args)
+        elif no_dropless_retry(config) and bool(eval_metrics.get("has_moe_overflow")):
+          # Eval does not change the train state: report the dropped tokens and keep going.
+          max_logging.error(
+              f"Eval step {eval_step_count}: MoE ragged buffer overflow; with moe_dropless_retry=False this eval"
+              " step's metrics include dropped tokens."
+          )
       eval_step_time_delta = datetime.datetime.now() - last_eval_step_completion
       last_eval_step_completion = datetime.datetime.now()
       metric_logger_instance.buffer_and_write_metrics(
@@ -978,6 +1070,13 @@ def build_dropless_graphdef(config, jit_model, state):
   del reconstructed, _
   gc.collect()
   return jit_model_dropless
+
+
+def build_step_fallback_graphdefs(config, jit_model, state):
+  """(dropless, first-phase) graphdefs of moe_dropless_fallback='step'; (None, None) when it has no dropless retry."""
+  if config.moe_dropless_fallback != "step" or not getattr(config, "moe_dropless_retry", True):
+    return None, None
+  return build_dropless_graphdef(config, jit_model, state), build_first_phase_graphdef(config, jit_model, state)
 
 
 def build_eval_graphdef(config, jit_model, state):
@@ -1168,9 +1267,7 @@ def train_loop(config, recorder, state=None):
     jit_model = model
   else:
     jit_model, state = nnx.split(state)
-    if config.moe_dropless_fallback == "step":
-      jit_model_dropless = build_dropless_graphdef(config, jit_model, state)
-      jit_model_first_phase = build_first_phase_graphdef(config, jit_model, state)
+    jit_model_dropless, jit_model_first_phase = build_step_fallback_graphdefs(config, jit_model, state)
     jit_model_eval = build_eval_graphdef(config, jit_model, state)
 
   if config.enable_diloco:

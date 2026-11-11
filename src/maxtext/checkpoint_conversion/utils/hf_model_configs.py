@@ -16,7 +16,6 @@
 This config defines the architectural configurations of the Hugging Face version of a model.
 """
 
-
 import transformers
 
 if transformers.__version__ >= "5.0.0":  # pyrefly: ignore[missing-attribute]
@@ -1984,6 +1983,102 @@ weaver_max_dict = {
 weaver_max_config = PTConfig(**weaver_max_dict)
 
 
+# Hy4 (tencent/Hy4-preview). PTConfig keeps the fields the converter reads without needing the hy_v4 config class.
+def _hy4_indexer_types(num_layers, num_dense, interval):
+  """HF indexer_types: dense layers and the first MoE layer of each group of `interval` run an indexer ("full").
+
+  For (78, 1, 4) this equals indexer_types in the tencent/Hy4-preview config.json (checked against it; the full
+  layers are listed in tests/unit/hy4_param_mapping_test.py).
+  """
+  return ["full" if i < num_dense or (i - num_dense) % interval == 0 else "shared" for i in range(num_layers)]
+
+
+hy4_preview_dict = {
+    "architectures": ["HYV4ForCausalLM"],
+    "model_type": "hy_v4",
+    "hidden_size": 6144,
+    "intermediate_size": 18432,
+    "moe_intermediate_size": 2048,
+    "num_hidden_layers": 78,
+    "num_attention_heads": 64,
+    "q_lora_rank": 2048,
+    "kv_lora_rank": 512,
+    "qk_nope_head_dim": 192,
+    "qk_rope_head_dim": 64,
+    "v_head_dim": 256,
+    "n_routed_experts": 256,
+    "n_shared_experts": 1,
+    "num_experts_per_tok": 8,
+    "hc_mult": 4,
+    "index_n_heads": 32,
+    "index_head_dim": 128,
+    "index_topk": 2048,
+    "mlp_layer_types": ["dense"] + ["sparse"] * 77,
+    "indexer_types": _hy4_indexer_types(78, 1, 4),
+    "num_nextn_predict_layers": 1,
+    "vocab_size": 120832,
+    "rms_norm_eps": 1e-05,
+    "tie_word_embeddings": False,
+}
+hy4_preview_config = PTConfig(**hy4_preview_dict)
+
+# Small Hy4 for conversion tests: 1 dense + 6 MoE layers = one IndexCache group of 4 and a remainder of 2.
+hy4_tiny_dict = dict(
+    hy4_preview_dict,
+    hidden_size=256,
+    intermediate_size=512,
+    moe_intermediate_size=64,
+    num_hidden_layers=7,
+    num_attention_heads=4,
+    q_lora_rank=64,
+    kv_lora_rank=32,
+    qk_nope_head_dim=32,
+    qk_rope_head_dim=16,
+    v_head_dim=32,
+    n_routed_experts=8,
+    num_experts_per_tok=2,
+    index_n_heads=16,  # enough heads that all-zero ReLU index scores (top-k ties) are rare
+    index_head_dim=32,
+    index_topk=16,
+    mlp_layer_types=["dense"] + ["sparse"] * 6,
+    indexer_types=_hy4_indexer_types(7, 1, 4),
+    num_nextn_predict_layers=1,  # MTP weights are not built by transformers; tests add them by name
+    vocab_size=1024,
+)
+hy4_tiny_config = PTConfig(**hy4_tiny_dict)
+
+# Hy4-mini (~0.43B, random init) for the end-to-end GPU / TPU alignment: hy4-preview's per-head dims (qk_nope 192,
+# qk_rope 64, v 256, kv_lora 512, indexer 32 x 128, top-k 2048), real vocabulary, 1 dense + 6 MoE layers (one IndexCache
+# group of 4 and a remainder of 2) + 1 MTP layer; smaller width, heads, q_lora, experts (16, top-4, divisible by EP 4).
+hy4_mini_dict = dict(
+    hy4_preview_dict,
+    hidden_size=1024,
+    intermediate_size=3072,
+    moe_intermediate_size=256,
+    num_hidden_layers=7,
+    num_attention_heads=8,
+    q_lora_rank=512,
+    n_routed_experts=16,
+    num_experts_per_tok=4,
+    mlp_layer_types=["dense"] + ["sparse"] * 6,
+    indexer_types=_hy4_indexer_types(7, 1, 4),
+    num_nextn_predict_layers=1,
+)
+hy4_mini_config = PTConfig(**hy4_mini_dict)
+
+# Hy4-mid (~5.19B, random init): hy4-mini's structure (7 layers + 1 MTP layer, 16 experts top-4) at production width and
+# attention (hidden 6144, 64 heads, q_lora 2048, dense FFN 18432), routed experts of width 512.
+hy4_mid_dict = dict(
+    hy4_mini_dict,
+    hidden_size=6144,
+    intermediate_size=18432,
+    moe_intermediate_size=512,
+    num_attention_heads=64,
+    q_lora_rank=2048,
+)
+hy4_mid_config = PTConfig(**hy4_mid_dict)
+
+
 # {maxtext model name: hf model config}
 HF_MODEL_CONFIGS = {
     "gemma2-2b": gemma2_2b_config,
@@ -2027,6 +2122,10 @@ HF_MODEL_CONFIGS = {
     "deepseek3-671b": deepseek3_671b_config,
     "deepseek3.2-671b": deepseek32_671b_config,
     "deepseek4-284b": deepseek4_284b_config,
+    "hy4-preview": hy4_preview_config,
+    "hy4-tiny": hy4_tiny_config,
+    "hy4-mini": hy4_mini_config,
+    "hy4-mid": hy4_mid_config,
     "gpt-oss-20b": gpt_oss_20b_config,
     "gpt-oss-120b": gpt_oss_120b_config,
     "qwen3-omni-30b-a3b": qwen3_omni_30b_a3b_config,

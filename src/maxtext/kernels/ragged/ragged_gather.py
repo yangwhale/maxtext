@@ -328,7 +328,8 @@ def calculate_col_size(hidden_size: int) -> int:
   num_lanes = tpu_info.num_lanes
   num_simd_lanes = sc_info.num_lanes
 
-  match tpu_info.chip_version:
+  # Branch on the integer generation; tpu_info.chip_version is a ChipVersion enum with string values.
+  match tpu_info.generation:
     case 6:
       target_bytes = (256 * 1024) * 0.9
     case 7:

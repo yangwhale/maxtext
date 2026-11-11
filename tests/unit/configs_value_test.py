@@ -377,6 +377,14 @@ class ConfigTest(absltest.TestCase):
       with self.assertRaisesRegex(ValueError, "does not support attention sinks"):
         pyconfig.initialize(argv)
 
+  def test_gmm_v2_native_transpose_rhs_requires_gmm_v2(self):
+    base = ["", _BASE_CONFIG_PATH, "run_name=test", "gmm_v2_native_transpose_rhs=True"]
+    for extra in (["use_tokamax_gmm=True", "use_gmm_v2=False"], ["use_tokamax_gmm=False", "use_gmm_v2=False"]):
+      with self.assertRaisesRegex(ValueError, "gmm_v2_native_transpose_rhs"):
+        pyconfig.initialize(base + extra)
+    config = pyconfig.initialize(base + ["use_tokamax_gmm=True", "use_gmm_v2=True"])
+    self.assertTrue(config.gmm_v2_native_transpose_rhs)
+
   def test_tpu_tokamax_ring_config_validation_rejects_unsupported_configs(self):
     base_args = [
         "",
@@ -1048,6 +1056,45 @@ class ConfigTest(absltest.TestCase):
     ]
     with self.assertRaises(pydantic.ValidationError):
       pyconfig.initialize(argv)
+
+  def test_moe_out_remat_policy(self):
+    """moe_out (MoE block output) is a custom remat tensor: device / offload land in the policy lists, remat in neither."""
+    deepseek = ["", _BASE_CONFIG_PATH, "run_name=test", "model_name=deepseek3-test", "remat_policy=custom"]
+    for location, attr in (("device", "tensors_on_device"), ("offload", "tensors_to_offload")):
+      config = pyconfig.initialize(deepseek + [f"moe_out={location}"])
+      self.assertIn("moe_out", getattr(config, attr))
+    config = pyconfig.initialize(deepseek)
+    self.assertNotIn("moe_out", config.tensors_on_device)
+    self.assertNotIn("moe_out", config.tensors_to_offload)
+
+  def test_moe_out_rejected_without_routed_and_shared_moe(self):
+    """A non-remat moe_out is rejected where no RoutedAndSharedMoE carries the name (dense or RoutedMoE-only models)."""
+    for model in ("default", "mixtral-8x7b"):
+      argv = ["", _BASE_CONFIG_PATH, "run_name=test", "remat_policy=custom", "moe_out=device"]
+      if model != "default":
+        argv.append(f"model_name={model}")
+      with self.assertRaisesRegex(ValueError, "moe_out=device needs a RoutedAndSharedMoE block"):
+        pyconfig.initialize(argv)
+
+  def test_moe_expert_weights_remat_policy(self):
+    """moe_expert_weights (gathered routed-expert weights) is a custom remat tensor: device / offload land in the policy
+    lists, remat in neither."""
+    for location, attr in (("device", "tensors_on_device"), ("offload", "tensors_to_offload")):
+      config = pyconfig.initialize(
+          ["", _BASE_CONFIG_PATH, "run_name=test", "remat_policy=custom", "num_experts=8", "base_moe_mlp_dim=7168",
+           "sparse_matmul=True", f"moe_expert_weights={location}"]
+      )
+      self.assertIn("moe_expert_weights", getattr(config, attr))
+    config = pyconfig.initialize(["", _BASE_CONFIG_PATH, "run_name=test", "remat_policy=custom"])
+    self.assertNotIn("moe_expert_weights", config.tensors_on_device)
+    self.assertNotIn("moe_expert_weights", config.tensors_to_offload)
+    # Only the sparse_matmul shard_map carries the name: elsewhere a non-remat value would be silently ignored.
+    # base_moe_mlp_dim = base_mlp_dim so the only invalid field is the one under test (checked by the message).
+    for bad in (["num_experts=8", "base_moe_mlp_dim=7168", "sparse_matmul=False"], ["num_experts=1"]):
+      with self.assertRaisesRegex(pydantic.ValidationError, "moe_expert_weights=device needs the sparse_matmul"):
+        pyconfig.initialize(
+            ["", _BASE_CONFIG_PATH, "run_name=test", "remat_policy=custom", *bad, "moe_expert_weights=device"]
+        )
 
   def test_indexer_cutoff_threshold_remat_policy(self):
     """Tests custom remat policy and validation for indexer_cutoff_threshold."""

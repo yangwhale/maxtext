@@ -15,6 +15,7 @@
 """Unit tests for Pallas Mosaic TPU v2 kernels."""
 
 import collections
+import re
 import pytest
 
 from absl.testing import absltest
@@ -1067,6 +1068,80 @@ class GmmTest(parameterized.TestCase):
       atol, rtol = 5e-2, 5e-2  # Unquantized Path (bfloat16 precision diffs)
 
     chex.assert_trees_all_close(actual, expected, atol=atol, rtol=rtol)
+
+
+
+class GmmRhsTransposedTest(parameterized.TestCase):
+  """gmm_v2(rhs_transposed=True) and ops.gmm(gmm_v2_native_transpose_rhs=True) against the explicit-transpose path."""
+
+  def setUp(self):
+    if jax.default_backend() != "tpu":
+      self.skipTest("Only supported on TPUs.")
+    super().setUp()
+
+  # in_size 640 with tile_k 512: two k tiles, the last one partial (exercises the valid_k mask on the k axis);
+  # out_size 512 with tile_n 256: two n tiles; uneven group sizes, with and without group_offset.
+  @parameterized.product(group_offset=[0, 2], in_size=[640, 1024])
+  def test_matches_explicit_transpose_bitwise(self, group_offset, in_size):
+    batch_size, out_size, num_groups = 512, 512, 8
+    k0, k1 = jax.random.split(jax.random.key(1))
+    lhs = jax.random.normal(k0, (batch_size, in_size), dtype=jnp.bfloat16)
+    rhs = jax.random.normal(k1, (num_groups - group_offset, in_size, out_size), dtype=jnp.bfloat16)
+    group_sizes = get_group_sizes(batch_size, num_groups)
+    offset = jnp.array(group_offset, dtype=jnp.int32)
+    tiles = gmm_backend.TileSizes(tile_m=128, tile_k=512, tile_n=256)
+    want = gmm_backend.gmm_v2(lhs, rhs, group_sizes, group_offset=offset, tile_info=tiles)
+    got = gmm_backend.gmm_v2(
+        lhs, jnp.swapaxes(rhs, 1, 2), group_sizes, group_offset=offset, tile_info=tiles, rhs_transposed=True
+    )
+    self.assertEqual(got.shape, want.shape)
+    self.assertTrue(bool(jnp.array_equal(got, want)))
+    assert_arrays_all_close(got, reference_gmm(lhs, rhs, group_sizes, group_offset=offset))
+
+  def test_rejects_unsupported(self):
+    lhs = jnp.zeros((256, 512), jnp.bfloat16)
+    gs = jnp.array([128, 128], jnp.int32)
+    with self.assertRaisesRegex(NotImplementedError, "rhs_transposed"):
+      gmm_backend.gmm_v2(lhs, jnp.zeros((2, 256, 512), jnp.int8), gs, rhs_transposed=True)
+    with self.assertRaisesRegex(ValueError, "tile_k"):
+      gmm_backend.gmm_v2(
+          lhs,
+          jnp.zeros((2, 256, 512), jnp.bfloat16),
+          gs,
+          rhs_transposed=True,
+          tile_info=gmm_backend.TileSizes(tile_m=128, tile_k=64, tile_n=256),
+      )
+
+  def test_ops_dlhs_native_matches_copy_and_falls_back(self):
+    from maxtext.kernels.megablox import ops  # pylint: disable=import-outside-toplevel
+
+    k0, k1, k2 = jax.random.split(jax.random.key(2), 3)
+    lhs = jax.random.normal(k0, (512, 640), jnp.bfloat16)
+    gs = get_group_sizes(512, 8)
+    tiling = (128, 512, 256) * 3
+
+    def dlhs(w, flag):
+      dout = jax.random.normal(k2, (512, w.shape[2]), jnp.float32)
+      f = lambda x: jnp.sum(
+          ops.gmm(x, w, gs, jnp.bfloat16, tiling, use_tokamax_backend=True, use_gmm_v2=True,
+                  gmm_v2_native_transpose_rhs=flag).astype(jnp.float32) * dout
+      )
+      g = jax.jit(jax.grad(f))
+      jaxpr = str(jax.make_jaxpr(g)(lhs))
+      return g(lhs), bool(re.search(r"""rhs_transposed['"]?\s*[:=]\s*True""", jaxpr))
+
+    w = jax.random.normal(k1, (8, 640, 512), jnp.bfloat16)
+    g_copy, j_copy = dlhs(w, False)
+    g_native, j_native = dlhs(w, True)
+    self.assertTrue(bool(jnp.array_equal(g_native, g_copy)))
+    # The flag reaches the kernel: only the native jaxpr carries an rhs_transposed gmm_v2 call.
+    self.assertTrue(j_native)
+    self.assertFalse(j_copy)
+    # float32 weights with bfloat16 gradients are not supported natively: the copy path runs instead of raising.
+    w32 = w.astype(jnp.float32)
+    g32, j32 = dlhs(w32, True)
+    self.assertFalse(j32)
+    self.assertEqual(g32.shape, lhs.shape)
 
 
 if __name__ == "__main__":

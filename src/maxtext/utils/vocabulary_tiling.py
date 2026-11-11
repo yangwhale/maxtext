@@ -28,6 +28,7 @@ from maxtext.utils.sharding import (
     FSDP_MESH_AXES,
 )
 from maxtext.common.common_types import ShardMode
+from maxtext.utils import accurate_math
 from maxtext.utils import max_utils
 
 
@@ -176,7 +177,10 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
       chunk_logits = _logits_for_chunk(chunk_head_params, chunk_other_params, chunk_rest, hidden_chunk)
       one_hot_label_chunk = jax.nn.one_hot(label_chunk, config.vocab_size)
       chunk_xent, chunk_z_loss = max_utils.cross_entropy_with_logits(
-          chunk_logits, one_hot_label_chunk, z_loss=config.z_loss_multiplier
+          chunk_logits,
+          one_hot_label_chunk,
+          z_loss=config.z_loss_multiplier,
+          accurate=accurate_math.log_mode(config, getattr(config, "transcendental_accuracy_highest", False)),
       )
 
       masked_xent = jnp.sum(chunk_xent * (segmentation_chunk != 0))
@@ -222,7 +226,12 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
     def _single_chunk_loss_fn(input_head_params, input_hidden_chunk, input_label_chunk, input_segmentation_chunk):
       chunk_logits = _logits_for_chunk(input_head_params, chunk_other_params, chunk_rest, input_hidden_chunk)
       one_hot_label_chunk = jax.nn.one_hot(input_label_chunk, config.vocab_size)
-      xent, _ = max_utils.cross_entropy_with_logits(chunk_logits, one_hot_label_chunk, z_loss=config.z_loss_multiplier)
+      xent, _ = max_utils.cross_entropy_with_logits(
+          chunk_logits,
+          one_hot_label_chunk,
+          z_loss=config.z_loss_multiplier,
+          accurate=accurate_math.log_mode(config, getattr(config, "transcendental_accuracy_highest", False)),
+      )
       return jnp.sum(xent * (input_segmentation_chunk != 0))
 
     def _bwd_scan_body(grad_head_acc, chunk_data):

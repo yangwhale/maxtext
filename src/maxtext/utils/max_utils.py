@@ -43,6 +43,7 @@ import orbax.checkpoint as ocp
 from orbax.checkpoint.experimental.emergency.multi_tier_checkpointing import initialization
 import psutil
 
+from maxtext.utils import accurate_math
 from maxtext.utils import elastic_utils
 from maxtext.common.gcloud_stub import is_decoupled
 from maxtext.common.gcloud_stub import writer, _TENSORBOARDX_AVAILABLE, StubSummaryWriter
@@ -91,6 +92,30 @@ def parse_libtpu_flags_to_dict(flags_str: str) -> dict:
     options_dict[key] = value
 
   return options_dict
+
+
+@partial(jax.custom_vjp, nondiff_argnums=(1,))
+def round_to_dtype_straight_through(x, dtype):
+  """Rounds float32 `x` to the values of `dtype` (result stays float32) with a straight-through gradient.
+
+  `jax.lax.reduce_precision` alone is transposed as a linear op, so the cotangent is rounded the same way; a
+  gradient that is a long sum (e.g. over all tokens) would then be rounded to `dtype` before reaching the float32
+  parameter. Here the forward value is the same reduce_precision, and the gradient passes through unchanged.
+  """
+  fi = jnp.finfo(dtype)
+  return jax.lax.reduce_precision(x, fi.nexp, fi.nmant)
+
+
+def _round_to_dtype_fwd(x, dtype):
+  return round_to_dtype_straight_through(x, dtype), None
+
+
+def _round_to_dtype_bwd(dtype, _, g):
+  del dtype
+  return (g,)
+
+
+round_to_dtype_straight_through.defvjp(_round_to_dtype_fwd, _round_to_dtype_bwd)
 
 
 def with_memory_kind(t, memory_kind):
@@ -623,8 +648,26 @@ def unbox_logicallypartioned(boxed_pytree):
 
 # Cross entropy implementation is taken from original T5X codebase:
 # https://github.com/google-research/t5x/blob/ace831eea1e2742b4299cd1a9af7e4f302038351/t5x/losses.py#L25-L101
-@jax.custom_vjp
 def cross_entropy_with_logits(
+    logits: jnp.ndarray,
+    targets: jnp.ndarray,
+    z_loss: float = 0.0,
+    accurate: bool = False,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+  """Cross entropy with a stable custom gradient (see _cross_entropy_with_logits_default).
+
+  accurate (transcendental_accuracy_highest): the exp / log in the forward and the softmax in the backward use
+  lax accuracy=HIGHEST; TPU's default float32 exp / log are approximations (see utils/accurate_math.py).
+  """
+  if accurate == "freebsd":  # transcendental_log_freebsd: the log of the sum through accurate_math.log_freebsd
+    return _cross_entropy_with_logits_accurate_freebsd(logits, targets, z_loss)
+  if accurate:
+    return _cross_entropy_with_logits_accurate(logits, targets, z_loss)
+  return _cross_entropy_with_logits_default(logits, targets, z_loss)
+
+
+@jax.custom_vjp
+def _cross_entropy_with_logits_default(
     logits: jnp.ndarray,
     targets: jnp.ndarray,
     z_loss: float = 0.0,
@@ -714,7 +757,45 @@ def _cross_entropy_with_logits_bwd(
   )  # sets z-loss coeff gradient to 0
 
 
-cross_entropy_with_logits.defvjp(_cross_entropy_with_logits_fwd, _cross_entropy_with_logits_bwd)
+_cross_entropy_with_logits_default.defvjp(_cross_entropy_with_logits_fwd, _cross_entropy_with_logits_bwd)
+
+
+def _cross_entropy_with_logits_fwd_accurate(logits, targets, z_loss=0.0, log_impl=True):
+  """_cross_entropy_with_logits_fwd with exp / log at accuracy=HIGHEST (same residuals); log_impl="freebsd" takes the
+  log of the sum through accurate_math.log_freebsd instead (transcendental_log_freebsd)."""
+  max_logit = logits.max(axis=-1, keepdims=True)
+  shifted = logits - max_logit
+  exp_shifted = accurate_math.exp(shifted, True)
+  sum_exp = jnp.sum(exp_shifted, axis=-1, keepdims=True)
+  log_sum = accurate_math.log(sum_exp, log_impl)
+  log_softmax = shifted - log_sum
+  loss = -jnp.sum(targets * log_softmax, axis=-1)
+  log_z = jnp.squeeze(log_sum + max_logit, axis=-1)
+  total_z_loss = z_loss * jax.lax.square(log_z)
+  loss += total_z_loss
+  return (loss, total_z_loss), (logits, targets, z_loss, exp_shifted, sum_exp, log_z)
+
+
+@jax.custom_vjp
+def _cross_entropy_with_logits_accurate(logits, targets, z_loss=0.0):
+  return _cross_entropy_with_logits_fwd_accurate(logits, targets, z_loss)[0]
+
+
+_cross_entropy_with_logits_accurate.defvjp(_cross_entropy_with_logits_fwd_accurate, _cross_entropy_with_logits_bwd)
+
+
+def _cross_entropy_with_logits_fwd_accurate_freebsd(logits, targets, z_loss=0.0):
+  return _cross_entropy_with_logits_fwd_accurate(logits, targets, z_loss, log_impl="freebsd")
+
+
+@jax.custom_vjp
+def _cross_entropy_with_logits_accurate_freebsd(logits, targets, z_loss=0.0):
+  return _cross_entropy_with_logits_fwd_accurate_freebsd(logits, targets, z_loss)[0]
+
+
+_cross_entropy_with_logits_accurate_freebsd.defvjp(
+    _cross_entropy_with_logits_fwd_accurate_freebsd, _cross_entropy_with_logits_bwd
+)
 
 
 def print_pytree_shape(print_str, ptree):

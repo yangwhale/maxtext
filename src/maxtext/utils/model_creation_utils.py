@@ -539,8 +539,33 @@ def create_model(
   # Model definition
   quant = quantizations.configure_quantization(config, quant_mode_str=quant_mode_str)
   model = get_transformer_model(config, mesh, quant, model_mode=model_mode, rngs=rngs)
+  if rngs is not None and config.init_weights_std > 0:
+    _reinit_weight_matrices(model, config.init_weights_std, config.init_weights_seed)
   model = quantizations.maybe_quantize_model(model, config)
   return model
+
+
+# Leaf names of the weight matrices that `init_weights_std` re-initializes ("wi" is the prefused MoE wi_0 / wi_1).
+_WEIGHT_MATRIX_NAMES = frozenset(
+    {"kernel", "embedding", "wi", "wi_0", "wi_1", "wo", "pre_alpha", "post_alpha", "res_alpha", "hc_fn"}
+)
+
+
+def _reinit_weight_matrices(model, std, seed):
+  """Re-draws every weight matrix of `model` from N(0, std^2), keeping shape and dtype.
+
+  The key comes from `seed` (init_weights_seed) and the parameter's position, not from the model's rngs. A matrix
+  whose default init is all zeros (a deliberate zero init, e.g. a residual conv) is left as it is.
+  """
+  key = jax.random.fold_in(jax.random.PRNGKey(seed), 0x5EED)
+  params = nnx.state(model, nnx.Param)
+  for i, (path, var) in enumerate(nnx.to_flat_state(params)):
+    if str(path[-1]) not in _WEIGHT_MATRIX_NAMES:
+      continue
+    value = var.get_value()
+    drawn = (jax.random.normal(jax.random.fold_in(key, i), value.shape, jnp.float32) * std).astype(value.dtype)
+    var.set_value(jnp.where(jnp.all(value == 0), value, drawn))
+  nnx.update(model, params)
 
 
 def get_nnx_create_model_fn(

@@ -108,6 +108,7 @@ class TestMHC(parameterized.TestCase):
       sequence_length=7,
       per_device_batch_size=None,
       dtype=None,
+      extra_kwargs=None,
   ):
     """Sets up the common configurations and modules for MHC testing."""
     self.dim = dim
@@ -147,6 +148,8 @@ class TestMHC(parameterized.TestCase):
     if dtype is not None:
       kwargs["dtype"] = dtype
       kwargs["weight_dtype"] = dtype
+    if extra_kwargs:
+      kwargs.update(extra_kwargs)
     self.config = pyconfig.initialize(
         [None, get_test_config_path()],
         **kwargs,
@@ -226,6 +229,172 @@ class TestMHC(parameterized.TestCase):
       output, metadata = module(self.pre_norm, layer, x=self.x, mhc_type=HyperConnectionType.MLP_DENSE)
       self.assertDictEqual(metadata, {})
       self.assertEqual(output.shape, (b, s, k, d))
+
+  def test_make_hyper_connections_default_is_mhc(self):
+    self._setup_mhc(4)
+    with nn_partitioning.axis_rules(self.config.logical_axis_rules):
+      module = mhc.make_hyper_connections(self.config, self.dim, self.mesh, self.rngs)
+    self.assertIsInstance(module, mhc.ManifoldConstrainedHyperConnections)
+
+  @parameterized.named_parameters(("Rate2", 2), ("Rate4", 4))
+  def test_ihc_matches_reference(self, rate):
+    """iHC output equals x_n + post_n * branch(norm(sum_n pre_n * x_n)) with the documented gates."""
+    self._setup_mhc(rate, dtype="float32", extra_kwargs={"hc_variant": "ihc", "hc_post_magnitude": 2.0})
+    with nn_partitioning.axis_rules(self.config.logical_axis_rules):
+      module = mhc.make_hyper_connections(self.config, self.dim, self.mesh, self.rngs)
+      self.assertIsInstance(module, mhc.IdentityHyperConnections)
+      # Larger-than-init weights so that the gates are far from their initial values.
+      keys = jax.random.split(jax.random.PRNGKey(1), 6)
+      kd = rate * self.dim
+      module.pre_alpha.value = jax.random.normal(keys[0], (kd, rate), jnp.float32)
+      module.post_alpha.value = jax.random.normal(keys[1], (kd, rate), jnp.float32)
+      module.pre_beta.value = jax.random.normal(keys[2], (rate,), jnp.float32)
+      module.post_beta.value = jax.random.normal(keys[3], (rate,), jnp.float32)
+      module.pre_alpha_scale.value = jnp.array([0.5], jnp.float32)
+      module.post_alpha_scale.value = jnp.array([0.7], jnp.float32)
+      layer = linears.MlpBlock(
+          config=self.config,
+          mesh=self.mesh,
+          in_features=self.config.emb_dim,
+          intermediate_dim=self.config.moe_mlp_dim,
+          activations=self.config.mlp_activations,
+          intermediate_dropout_rate=self.config.dropout_rate,
+          dtype=self.config.dtype,
+          weight_dtype=self.config.weight_dtype,
+          model_mode=self.config.model_call_mode,
+          rngs=self.rngs,
+      )
+      with jax.default_matmul_precision("highest"):
+        output, _ = module(self.pre_norm, layer, x=self.x, mhc_type=HyperConnectionType.MLP_DENSE)
+
+        def reference(post_magnitude):
+          x = np.asarray(self.x, np.float64)
+          b, s, k, d = x.shape
+          flat = x.reshape(b, s, k * d)
+          inv_rms = 1.0 / np.sqrt(np.mean(flat**2, axis=-1, keepdims=True) + self.config.normalization_layer_epsilon)
+          sig = lambda v: 1.0 / (1.0 + np.exp(-v))
+          mix_pre = (flat @ np.asarray(module.pre_alpha.value, np.float64)) * inv_rms
+          mix_post = (flat @ np.asarray(module.post_alpha.value, np.float64)) * inv_rms
+          pre = sig(mix_pre * 0.5 + np.asarray(module.pre_beta.value, np.float64)) + self.config.hc_eps
+          post = post_magnitude * sig(mix_post * 0.7 + np.asarray(module.post_beta.value, np.float64)) + self.config.hc_eps
+          layer_input = np.sum(pre[..., None] * x, axis=2)
+          branch = np.asarray(layer(inputs=self.pre_norm(jnp.asarray(layer_input, jnp.float32))), np.float64)
+          return x + post[..., None] * branch[:, :, None, :]
+
+        np.testing.assert_allclose(np.asarray(output, np.float64), reference(2.0), rtol=1e-5, atol=1e-5)
+        # Negative control: the same check must reject a different post-gate magnitude.
+        self.assertFalse(np.allclose(np.asarray(output, np.float64), reference(2.5), rtol=1e-5, atol=1e-5))
+
+  @parameterized.named_parameters(("Einsum", False), ("Unrolled", True))
+  def test_ihc_stream_sum_matches_multiply_reduce(self, unrolled):
+    """The stream sum (einsum or unrolled) equals the float32 multiply-reduce, with the gate projections at hc_matmul_precision=default."""
+    self._setup_mhc(
+        4, extra_kwargs={"hc_variant": "ihc", "hc_matmul_precision": "default", "ihc_stream_sum_unrolled": unrolled}
+    )
+    with nn_partitioning.axis_rules(self.config.logical_axis_rules):
+      module = mhc.make_hyper_connections(self.config, self.dim, self.mesh, self.rngs)
+      x = jax.random.normal(jax.random.PRNGKey(5), (2, 7, 4, self.dim), jnp.float32)
+      pre, _ = module.gates(x)
+      captured = {}
+
+      def norm(v):
+        captured["layer_input"] = v
+        return v
+
+      module(norm, lambda inputs: inputs, x=x, mhc_type=HyperConnectionType.MLP_DENSE)
+    expected = np.sum(np.asarray(pre, np.float64)[..., None] * np.asarray(x, np.float64), axis=2)
+    np.testing.assert_allclose(np.asarray(captured["layer_input"], np.float64), expected, rtol=1e-6, atol=1e-6)
+
+  def test_ihc_stream_sum_unrolled_grads_match_einsum(self):
+    """Unrolled and einsum stream sums give the same float32 output and gradients (wrt x and the gate weights)."""
+    x = jax.random.normal(jax.random.PRNGKey(6), (2, 7, 4, 32), jnp.float32)
+    results = []
+    for unrolled in (False, True):
+      self._setup_mhc(4, extra_kwargs={"hc_variant": "ihc", "ihc_stream_sum_unrolled": unrolled})
+      with nn_partitioning.axis_rules(self.config.logical_axis_rules):
+        module = mhc.make_hyper_connections(self.config, 32, self.mesh, nnx.Rngs(params=0))
+        graphdef, params, rest = nnx.split(module, nnx.Param, ...)
+
+        def loss(params, x):
+          m = nnx.merge(graphdef, params, rest)
+          out, _ = m(lambda v: v, lambda inputs: jnp.tanh(inputs), x=x, mhc_type=HyperConnectionType.MLP_DENSE)
+          return jnp.sum(out**2)
+
+        val, (g_params, g_x) = jax.value_and_grad(loss, argnums=(0, 1))(params, x)
+        results.append((val, g_params, g_x))
+    (v0, p0, x0), (v1, p1, x1) = results
+    np.testing.assert_allclose(v1, v0, rtol=1e-6)
+    np.testing.assert_allclose(x1, x0, rtol=1e-5, atol=1e-6)
+    for a, b in zip(jax.tree.leaves(p0), jax.tree.leaves(p1)):
+      np.testing.assert_allclose(b, a, rtol=1e-5, atol=1e-6)
+
+  def test_ihc_stream_sum_unrolled_drops_the_contraction(self):
+    """With the flag on, the traced call has one dot_general fewer (the k-axis einsum is gone); a typo'd or ignored
+    flag would leave both traces identical."""
+    counts = []
+    for unrolled in (False, True):
+      self._setup_mhc(4, extra_kwargs={"hc_variant": "ihc", "ihc_stream_sum_unrolled": unrolled})
+      with nn_partitioning.axis_rules(self.config.logical_axis_rules):
+        module = mhc.make_hyper_connections(self.config, 32, self.mesh, nnx.Rngs(params=0))
+        x = jnp.ones((2, 7, 4, 32), jnp.float32)
+        fn = lambda x: module(lambda v: v, lambda inputs: inputs, x=x, mhc_type=HyperConnectionType.MLP_DENSE)[0]
+        jaxpr = jax.make_jaxpr(fn)(x)
+      counts.append(str(jaxpr).count("dot_general"))
+    self.assertEqual(counts[1], counts[0] - 1)
+
+  def test_ihc_stream_sum_unrolled_rejected_for_mhc(self):
+    """ihc_stream_sum_unrolled has no effect on mHC, so the config rejects it there."""
+    with self.assertRaises(ValueError):
+      self._setup_mhc(4, extra_kwargs={"hc_variant": "mhc", "ihc_stream_sum_unrolled": True})
+
+  def test_ihc_moe_branch_passes_metadata(self):
+    self._setup_mhc(4, extra_kwargs={"hc_variant": "ihc"})
+    with nn_partitioning.axis_rules(self.config.logical_axis_rules):
+      module = mhc.make_hyper_connections(self.config, self.dim, self.mesh, self.rngs)
+      layer = moe.RoutedMoE(
+          config=self.config,
+          num_experts=self.config.num_experts,
+          num_experts_per_tok=self.config.num_experts_per_tok,
+          mesh=self.mesh,
+          kernel_init=nd_dense_init(1.0, "fan_in", "truncated_normal"),
+          kernel_axes=("embed", "mlp"),
+          intermediate_dim=self.config.base_mlp_dim,
+          dtype=self.config.dtype,
+          weight_dtype=self.config.weight_dtype,
+          rngs=self.rngs,
+      )
+      output, metadata = module(self.pre_norm, layer, x=self.x, mhc_type=HyperConnectionType.MLP_MOE)
+      self.assertEqual(output.shape, self.x.shape)
+      self.assertEqual(output.dtype, self.x.dtype)
+      self.assertSetEqual(set(metadata), {"load_balance_loss", "moe_bias_updates"})
+
+  def test_hc_head_reads_eps_and_precision_from_config(self):
+    self._setup_mhc(
+        4,
+        extra_kwargs={"use_hc_head": True, "hc_head_norm_epsilon": 1e-5, "hc_eps": 1e-4, "hc_matmul_precision": "highest"},
+    )
+    head = mhc.DeepSeek4HyperHead(config=self.config, mesh=self.mesh, rngs=self.rngs)
+    self.assertEqual(head.norm_eps, 1e-5)
+    self.assertEqual(head.eps, 1e-4)
+    self.assertEqual(head.precision, jax.lax.Precision.HIGHEST)
+    # Empty hc_matmul_precision keeps the head on matmul_precision and iHC on highest.
+    self._setup_mhc(4, extra_kwargs={"hc_variant": "ihc"})
+    self.assertEqual(
+        mhc.DeepSeek4HyperHead(config=self.config, mesh=self.mesh, rngs=self.rngs).precision,
+        jax.lax.Precision(self.config.matmul_precision),
+    )
+    with nn_partitioning.axis_rules(self.config.logical_axis_rules):
+      ihc = mhc.make_hyper_connections(self.config, self.dim, self.mesh, self.rngs)
+    self.assertEqual(ihc.precision, jax.lax.Precision.HIGHEST)
+
+  @parameterized.named_parameters(
+      ("ihc_rate1", 1, {"hc_variant": "ihc"}),
+      ("ihc_lite", 4, {"hc_variant": "ihc", "enable_mhc_lite": True}),
+      ("head_rate1", 1, {"use_hc_head": True}),
+  )
+  def test_hc_config_rejects_unsupported_combinations(self, rate, extra):
+    with self.assertRaises(ValueError):
+      self._setup_mhc(rate, extra_kwargs=extra)
 
   @parameterized.named_parameters(("Rate3", 3), ("Rate4", 4))
   def test_attention_layer_output_shape(self, rate):

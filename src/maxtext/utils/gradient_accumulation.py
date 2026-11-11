@@ -27,6 +27,23 @@ from maxtext.layers.moe import load_balance_updates_from_counts
 from maxtext.utils.sharding import maybe_shard_with_name
 
 
+def _path_has_key(path, name):
+  return any(getattr(k, "key", getattr(k, "name", None)) == name for k in path)
+
+
+def reduce_microbatch_aux(scanned_aux):
+  """Combine the per-microbatch aux stacked by the accumulation scan (leading axis = microbatch).
+
+  Everything is summed over microbatches, except QK-Clip's sowed max_logits, which are a maximum: QK-Clip clips by
+  the largest attention logit of the global batch, so the step's value is the max over microbatches. Summing them
+  (as before) made the clip see about gradient_accumulation_steps times the true max.
+  """
+  return jax.tree_util.tree_map_with_path(
+      lambda path, x: jnp.max(x, axis=0) if _path_has_key(path, "max_logits") else jnp.sum(x, axis=0),
+      scanned_aux,
+  )
+
+
 def gradient_accumulation_loss_and_grad(
     _loss_fn,
     config,
@@ -128,6 +145,19 @@ def gradient_accumulation_loss_and_grad(
   else:
     grad_func = jax.value_and_grad(_scaled_loss_fn, argnums=4, has_aux=True)
 
+  # XLA bug workaround: under pure data parallelism, when the data-parallel all-reduce of a scatter-accumulated gradient
+  # (the float32 token-embedding gradient of embedding_grad_fp32) is moved out of the accumulation loop, the accumulator
+  # on every partition but 0 is zeroed in each iteration instead of once, so all but the last microbatch's contribution
+  # is lost (measured on v5p: data parallelism 8 + GA 2 keeps 0.51 of the embedding-gradient norm). An optimization
+  # barrier on each microbatch gradient blocks that code motion. Only active when all three conditions hold, so every
+  # other configuration compiles the same program as before. embedding_grad_fp32_local_bf16_comm gets the same barrier: its
+  # per-microbatch bfloat16 all-reduce must stay inside the loop (moved out, it would sum the float32 accumulator).
+  barrier_microbatch_grads = (
+      (getattr(config, "embedding_grad_fp32", False) or getattr(config, "embedding_grad_fp32_local_bf16_comm", False))
+      and param_mesh.shape.get("data", 1) > 1
+      and config.gradient_accumulation_steps > 1
+  )
+
   def accumulate_gradient(acc_grad_and_loss, data):
     ga_params = acc_grad_and_loss["ga_params"]
     # Scope double-buffering to model scans, not the enclosing gradient accumulation scan.
@@ -154,6 +184,8 @@ def gradient_accumulation_loss_and_grad(
     acc_grad_and_loss["moe_lb_loss"] += aux["moe_lb_loss"]
     acc_grad_and_loss["indexer_loss"] += aux["indexer_loss"]
     acc_grad_and_loss["mtp_loss"] += aux["mtp_loss"]
+    if barrier_microbatch_grads:
+      cur_batch_gradient = jax.lax.optimization_barrier(cur_batch_gradient)
     acc_grad_and_loss["grad"] = jax.tree_util.tree_map(lambda x, y: x + y, cur_batch_gradient, acc_grad_and_loss["grad"])
     acc_grad_and_loss["total_weights"] += aux["total_weights"]
     return acc_grad_and_loss, aux
@@ -206,10 +238,10 @@ def gradient_accumulation_loss_and_grad(
       raw_grads,
   )
   scanned_aux = aux
-  aux = jax.tree.map(lambda x: jnp.sum(x, axis=0), aux)  # pytype: disable=module-attr
+  aux = reduce_microbatch_aux(aux)
   # The auxiliary losses are per-microbatch means; the step's value is their mean over microbatches (as in `loss`
   # above), not their sum, so the logged learning/{moe_lb,indexer,mtp}_loss match GA=1.
-  for key in ("moe_lb_loss", "indexer_loss", "mtp_loss"):
+  for key in ("moe_lb_loss", "indexer_loss", "mtp_loss", "indexer_loss_per_layer"):
     if key in aux:
       aux[key] = aux[key] / config.gradient_accumulation_steps
   if getattr(config, "routed_bias", False) and getattr(config, "routed_bias_update_rate", 0.0) > 0.0:
@@ -224,9 +256,10 @@ def gradient_accumulation_loss_and_grad(
       if aux.get(key) is not None:
         aux[key] = jax.tree.map(finalize_bias, aux[key])
     if "intermediate_outputs" in aux:
+      # sow stores a tuple, so the leaf path ends in a sequence index below the "moe_bias_updates" key.
       aux["intermediate_outputs"] = jax.tree_util.tree_map_with_path(
           lambda path, val: (
-              finalize_bias(val) if path and getattr(path[-1], "key", None) == "moe_bias_updates" else val
+              finalize_bias(val) if any(getattr(k, "key", None) == "moe_bias_updates" for k in path) else val
           ),
           aux["intermediate_outputs"],
       )

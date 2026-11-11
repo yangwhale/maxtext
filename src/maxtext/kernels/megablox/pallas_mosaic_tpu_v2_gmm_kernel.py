@@ -242,6 +242,9 @@ class GmmConfigs:
   has_partial_sum: bool
   zero_init: bool
   fuse_act: str | None
+  # rhs arrives as [size_group, size_n, size_k] (transposed weight); tiles are read as
+  # [tile_n, tile_k] and the matmul contracts the last dims, so no HBM transpose copy is made.
+  rhs_transposed: bool = False
 
   @property
   def num_quant_blocks_per_tile_k(self) -> int:
@@ -285,6 +288,8 @@ class IndexMaps:
 
   def rhs_weight_index_map(self, n_id: jax.Array, gm_id: jax.Array, k_id: jax.Array):
     group_id = self.metadata_ref.gm_id_to_group_id[gm_id]
+    if self.cfgs.rhs_transposed:
+      return (group_id, n_id, k_id)
     return (group_id, k_id, n_id)
 
   def rhs_bias_index_map(self, n_id: jax.Array, gm_id: jax.Array, _: jax.Array):
@@ -350,8 +355,9 @@ def generate_block_specs(
     packing = pl.cdiv(32, jax.dtypes.itemsize_bits(cfgs.rhs_cfgs.dtype))
     tile_k_rhs //= packing
 
+  rhs_block = (tile_k_rhs, cfgs.tiles.tile_n) if not cfgs.rhs_transposed else (cfgs.tiles.tile_n, tile_k_rhs)
   rhs_weight_spec = pl.BlockSpec(
-      (None, tile_k_rhs, cfgs.tiles.tile_n),
+      (None, *rhs_block),
       index_map.rhs_weight_index_map,
       pipeline_mode=pl.Buffered(buffer_count=3),
   )
@@ -394,7 +400,7 @@ def inner_kernel(
     # In
     tiled_lhs_ref: LhsRef,
     # [tile_m // size_lhs_sublane, size_lhs_sublane, tile_k]
-    tiled_rhs_ref: RhsRef,  # [tile_k, tile_n]
+    tiled_rhs_ref: RhsRef,  # [tile_k, tile_n] ([tile_n, tile_k] with cfgs.rhs_transposed)
     # Partial Sum
     tiled_ps_ref: jax.Array | None,
     # [tile_m // size_lhs_sublane, size_lhs_sublane, tile_n]
@@ -418,7 +424,8 @@ def inner_kernel(
 
   Args:
     tiled_lhs_ref: Contains value lhs[m_start:m_end, k_start:k_end]
-    tiled_rhs_ref: Contains value rhs[g_id, k_start:k_end, n_start:n_end]. where
+    tiled_rhs_ref: Contains value rhs[g_id, k_start:k_end, n_start:n_end] (rhs[g_id, n_start:n_end, k_start:k_end]
+      with cfgs.rhs_transposed), where
       g_id is the group associated with lhs[m_start:m_end, :]
     tiled_out_ref: Contains value out[m_start:m_end, n_start:n_end]
     partial_out_ref: Contains last size_lhs_sublane rows of the previous output.
@@ -440,12 +447,13 @@ def inner_kernel(
     # axis. This expands the K dimension back to tile_k.
     if cfgs.rhs_cfgs.should_bitcast:
       tiled_rhs = pltpu.bitcast(tiled_rhs, cfgs.rhs_cfgs.dtype)
-    rhs_tile_n = tiled_rhs.shape[1]
+    rhs_tile_n = tiled_rhs.shape[0] if cfgs.rhs_transposed else tiled_rhs.shape[1]
 
     # This should only be taken in the case where we don't requantize
     # the scales and thus we need to dequantize inside VMEM to avoid small
     # contracting dimensions
     if cfgs.rhs_cfgs.should_dequantize_before_matmul:
+      assert not cfgs.rhs_transposed, "dequantize-before-matmul indexes rhs as [tile_k, tile_n]"
       rhs_qbs = cfgs.rhs_cfgs.quant_block_size
       tiled_rhs_scale = tiled_rhs_ref.get_scale().astype(acc_ref.dtype)
       num_blocks = cfgs.num_quant_blocks_per_tile_k
@@ -455,7 +463,7 @@ def inner_kernel(
 
     valid_k = cfgs.dims.size_k % cfgs.tiles.tile_k
     if is_last_k_step and valid_k != 0:
-      mask_rhs = lax.broadcasted_iota(jnp.int32, tiled_rhs.shape, 0) < valid_k
+      mask_rhs = lax.broadcasted_iota(jnp.int32, tiled_rhs.shape, 1 if cfgs.rhs_transposed else 0) < valid_k
       tiled_rhs = jnp.where(mask_rhs, tiled_rhs, 0)
 
     # Step 2: Matmul.
@@ -473,11 +481,20 @@ def inner_kernel(
           start_k = b_id * rhs_qbs  # pyrefly: ignore[unsupported-operation]
           end_k = start_k + rhs_qbs  # pyrefly: ignore[unsupported-operation]
 
-          block_acc = jnp.matmul(
-              tiled_lhs[:, start_k:end_k],
-              tiled_rhs[start_k:end_k, start_n:end_n],
-              preferred_element_type=jnp.float32,
-          ).astype(acc_ref.dtype)
+          if cfgs.rhs_transposed:
+            # [tile_m, k] x [n, k] -> [tile_m, n]: contract the last dim of both operands.
+            block_acc = lax.dot_general(
+                tiled_lhs[:, start_k:end_k],
+                tiled_rhs[start_n:end_n, start_k:end_k],
+                (((1,), (1,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            ).astype(acc_ref.dtype)
+          else:
+            block_acc = jnp.matmul(
+                tiled_lhs[:, start_k:end_k],
+                tiled_rhs[start_k:end_k, start_n:end_n],
+                preferred_element_type=jnp.float32,
+            ).astype(acc_ref.dtype)
 
           if cfgs.rhs_cfgs.should_dequantize_after_matmul:
             tiled_rhs_scale = tiled_rhs_ref.get_scale()
@@ -486,7 +503,8 @@ def inner_kernel(
           acc_n += block_acc
         acc_list.append(acc_n)
     else:
-      # Quantized matmul path.
+      # Quantized matmul path (indexes rhs as [tile_k, tile_n]).
+      assert not cfgs.rhs_transposed, "the quantized matmul path does not support rhs_transposed"
       lhs_q_dtype = cfgs.lhs_cfgs.quant_dtype
       q_block_size = cfgs.lhs_cfgs.quant_block_size
 
@@ -832,7 +850,7 @@ def kernel_main(
     group_offset_ref: jax.Array,  # int32[1]
     # In
     lhs_ref: LhsRef,  # value: [size_m, size_k]
-    rhs_ref: WeightsRef,  # [size_group, size_k, size_n]
+    rhs_ref: WeightsRef,  # [size_group, size_k, size_n] ([size_group, size_n, size_k] with cfgs.rhs_transposed)
     partial_sum_ref: jax.Array,  # [size_m, size_n]
     # Out
     out_ref: jax.Array,  # [size_m, size_n]
@@ -1047,6 +1065,21 @@ def calculate_tiling(
   return TileSizes(tile_m=tile_m, tile_k=tile_k, tile_n=tile_n)
 
 
+def supports_rhs_transposed(lhs_dtype, rhs_dtype, *, has_scale=False, has_bias=False, fuse_act=None) -> bool:
+  """Whether gmm_v2 can read rhs transposed ([size_group, size_n, size_k]) for these operands.
+
+  Only the plain path: unquantized rhs of the lhs dtype (no promotion inside the kernel), at least 8 bits, no rhs
+  scale, bias or fused activation. Callers use this to choose between rhs_transposed and an explicit transpose.
+  """
+  return (
+      jnp.dtype(lhs_dtype) == jnp.dtype(rhs_dtype)
+      and jax.dtypes.itemsize_bits(rhs_dtype) >= 8
+      and not has_scale
+      and not has_bias
+      and fuse_act is None
+  )
+
+
 def validate_inputs(
     lhs: jax.Array,
     rhs: jax.Array,
@@ -1058,16 +1091,26 @@ def validate_inputs(
     fuse_act: str | None = None,
     maybe_quantize_lhs: bool = True,
     lhs_scale: jax.Array | None = None,
+    rhs_transposed: bool = False,
 ) -> Dimensions:
   """Validates the inputs for the GMM kernel."""
 
   size_m = lhs.shape[0]
-  size_group, size_k, size_n = rhs.shape
+  if rhs_transposed:
+    size_group, size_n, size_k = rhs.shape
+    if not supports_rhs_transposed(
+        lhs.dtype, rhs.dtype, has_scale=rhs_scale is not None, has_bias=rhs_bias is not None, fuse_act=fuse_act
+    ):
+      raise NotImplementedError(
+          "rhs_transposed supports only unquantized rhs of the lhs dtype (>= 8 bits) without scale, bias or fused"
+          f" activation; got lhs {lhs.dtype}, rhs {rhs.dtype}."
+      )
+  else:
+    size_group, size_k, size_n = rhs.shape
   size_lhs_group = group_sizes.shape[0]
 
   assert size_group <= size_lhs_group
   assert lhs.shape == (size_m, size_k)
-  assert rhs.shape == (size_group, size_k, size_n)
   if rhs_bias is not None:
     assert rhs_bias.shape == (size_group, 1, size_n)
   if partial_sum is not None:
@@ -1171,6 +1214,7 @@ def make_gmm_configs(
     zero_initialize: bool,
     fuse_act: str | None = None,
     lhs_scale: jax.Array | None = None,
+    rhs_transposed: bool = False,
 ):
   """Fills the GMM config for the GMM kernel."""
 
@@ -1185,6 +1229,7 @@ def make_gmm_configs(
       fuse_act,
       maybe_quantize_lhs,
       lhs_scale,
+      rhs_transposed,
   )
 
   if rhs_scale is not None:
@@ -1258,6 +1303,18 @@ def make_gmm_configs(
   else:
     tiles = tile_info(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act, partial_sum is not None)
 
+  if rhs_transposed:
+    # Weight blocks are (tile_n, tile_k): tile_k is the minor (lane) dim, tile_n the second-minor (sublane) dim.
+    tpu_info = pltpu.get_tpu_info()
+    sublane = tpu_info.get_sublane_tiling(rhs.dtype)
+    if not (tiles.tile_k % tpu_info.num_lanes == 0 or tiles.tile_k == dims.size_k) or not (
+        tiles.tile_n % sublane == 0 or tiles.tile_n == dims.size_n
+    ):
+      raise ValueError(
+          f"rhs_transposed needs tile_k a multiple of {tpu_info.num_lanes} (or size_k) and tile_n a multiple of"
+          f" {sublane} (or size_n); got tile_k={tiles.tile_k}, tile_n={tiles.tile_n}."
+      )
+
   return GmmConfigs(
       dims=dims,
       tiles=tiles,
@@ -1268,6 +1325,7 @@ def make_gmm_configs(
       has_partial_sum=partial_sum is not None,
       zero_init=zero_initialize,
       fuse_act=fuse_act,
+      rhs_transposed=rhs_transposed,
   )
 
 
@@ -1292,11 +1350,12 @@ def get_metadata(cfgs: GmmConfigs) -> dict[str, str | int | float]:
         "maybe_quantize_lhs",
         "zero_initialize",
         "fuse_act",
+        "rhs_transposed",
     ]
 )
 def gmm_v2(
     lhs: jax.Array,  # [size_m, size_k]
-    rhs: jax.Array,  # [size_group, size_k, size_n]
+    rhs: jax.Array,  # [size_group, size_k, size_n] ([size_group, size_n, size_k] with rhs_transposed)
     group_sizes: jax.Array,  # int32[size_lhs_group]
     rhs_scale: jax.Array | None = None,  # [size_group, num_blocks, 1, out_size]
     rhs_bias: jax.Array | None = None,  # [size_group, 1, out_size]
@@ -1312,6 +1371,7 @@ def gmm_v2(
     maybe_quantize_lhs: bool = True,
     zero_initialize: bool = True,
     fuse_act: str | None = None,
+    rhs_transposed: bool = False,
 ) -> jax.Array:
   """GMM kernel implemented with emit_pipeline.
 
@@ -1321,7 +1381,7 @@ def gmm_v2(
 
   Args:
     lhs: lhs with shape [size_m, size_k].
-    rhs: rhs with shape [size_group, size_k, size_n].
+    rhs: rhs with shape [size_group, size_k, size_n] ([size_group, size_n, size_k] with rhs_transposed).
     group_sizes: The group sizes of lhs rows of shape [size_lhs_group,].
     rhs_scale: The rhs scale of shape [size_group, num_blocks, 1, out_size].
     rhs_bias: The rhs bias of shape [size_group, 1, out_size].
@@ -1341,6 +1401,8 @@ def gmm_v2(
     maybe_quantize_lhs: Quantize lhs if set to True and rhs is quantized.
     zero_initialize: Whether to initialize unvisited output elements to zero.
     fuse_act: Activation function to fuse with GMM, None if no fusion.
+    rhs_transposed: rhs is [size_group, size_n, size_k]; computes lhs @ rhs^T
+      per group without materializing the transpose (unquantized rhs only).
 
   Returns:
     Output of shape [size_m, size_n].
@@ -1373,6 +1435,7 @@ def gmm_v2(
       zero_initialize=zero_initialize,
       fuse_act=fuse_act,
       lhs_scale=lhs_scale,
+      rhs_transposed=rhs_transposed,
   )
   dims = cfgs.dims
   tiles = cfgs.tiles

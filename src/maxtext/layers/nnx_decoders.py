@@ -85,6 +85,30 @@ from maxtext.utils.sharding import create_sharding
 # ------------------------------------------------------------------------------
 
 
+def _is_complex_aval(aval) -> bool:
+  return jnp.issubdtype(getattr(aval, "dtype", jnp.float32), jnp.complexfloating)
+
+
+def save_everything_except_complex(prim, *avals, **params) -> bool:
+  """Remat policy for remat_policy=save_everything: save every forward intermediate except complex-valued ones.
+
+  jax.checkpoint inserts reduce_precision on every saved floating residual, and reduce_precision rejects complex
+  dtypes (jax 0.11), so jax.checkpoint_policies.everything_saveable fails on the complex RoPE path (e.g. YaRN). The
+  few complex values are recomputed in the backward pass from saved real inputs, which gives the same values. A
+  policy only sees the input avals, so ops that make a complex value from real inputs are excluded by primitive.
+  """
+  if any(_is_complex_aval(a) for a in avals):
+    return False
+  name = prim.name
+  if name == "complex":
+    return False
+  if name == "convert_element_type" and jnp.issubdtype(params.get("new_dtype", jnp.float32), jnp.complexfloating):
+    return False
+  if name == "fft":
+    return False
+  return True
+
+
 class NNXDecoderLayer(nnx.Module):
   """
   Transformer decoder layer converted to NNX
@@ -478,9 +502,11 @@ class NNXDecoder(nnx.Module):
           dtype=jnp.float32 if config.logits_dot_in_fp32 else config.dtype,
           kernel_axes=("embed_vocab", "vocab"),
           shard_mode=config.shard_mode,
-          matmul_precision=self.config.matmul_precision,
+          # logits_dot_in_fp32 alone runs the fp32 head as one bf16 pass on TPU at the default precision.
+          matmul_precision=config.logits_matmul_precision or config.matmul_precision,
           parameter_memory_host_offload=config.parameter_memory_host_offload,
           weight_quant=quantizations.get_weight_quant_config(config, "logits_dense"),
+          kernel_grad_fp32=getattr(config, "logits_dense_wgrad_fp32", False),
           rngs=rngs,
       )
 
@@ -493,7 +519,10 @@ class NNXDecoder(nnx.Module):
     self.is_qwen3_next = self.config.decoder_block == DecoderBlockType.QWEN3_NEXT
     self.is_qwen3_5 = self.config.decoder_block == DecoderBlockType.QWEN3_5
 
-    if config.mhc_expansion_rate > 1 and config.decoder_block == DecoderBlockType.DEEPSEEK4:
+    self.use_hc_head = config.mhc_expansion_rate > 1 and (
+        config.decoder_block == DecoderBlockType.DEEPSEEK4 or config.use_hc_head
+    )
+    if self.use_hc_head:
       self.hc_head = mhc.DeepSeek4HyperHead(
           config=config,
           mesh=self.mesh,
@@ -704,6 +733,35 @@ class NNXDecoder(nnx.Module):
         dense_cls, length=num_dense, metadata_axis_name="dense_layers", rngs=rngs
     )
     num_moe = config.num_decoder_layers - config.first_num_dense_layers
+    if config.use_indexer and config.indexer_share_interval > 1:
+      # IndexCache: scan over blocks of indexer_share_interval MoE layers that share one indexer top-k mask; the
+      # layers past the last whole block form one short remainder block, which also starts with an indexer layer.
+      # Each block rematerializes its sub-layers one by one (the scan below skips block-level remat), and each
+      # sub-layer's weights are fenced on the previous sub-layer's output; without the fence XLA issues every
+      # sub-layer's FSDP all-gathers up front, which is what overflowed HBM on hy4-770b.
+      block_length = config.indexer_share_interval
+      policy = self.get_remat_policy()
+      self.moe_layers = self._create_scanned_layers(
+          deepseek.DeepSeekIndexCacheMoEBlock,
+          length=num_moe // block_length,
+          metadata_axis_name="moe_layers",
+          rngs=rngs,
+          num_of_layers=block_length,
+          remat_policy_fn=policy,
+          apply_internal_remat=True,
+      )
+      if num_moe % block_length:
+        self.moe_layers_remainder = deepseek.DeepSeekIndexCacheMoEBlock(
+            config=config,
+            model_mode=self.model_mode,
+            mesh=self.mesh,
+            rngs=rngs,
+            quant=self.quant,
+            num_of_layers=num_moe % block_length,
+            remat_policy_fn=policy,
+            apply_internal_remat=True,
+        )
+      return
     self.moe_layers = self._create_scanned_layers(moe_cls, length=num_moe, metadata_axis_name="moe_layers", rngs=rngs)
 
   def _init_scanned_gemma3(self, decoder_block_classes, rngs, mesh):
@@ -1026,6 +1084,7 @@ class NNXDecoder(nnx.Module):
       unroll: int = 1,
       metadata_axis_name: str = "layers",
       forced_routed_experts_scanned=None,
+      scanned_kwargs=None,
       **kwargs,
   ):
     """Runs the layer stack using nnx.scan.
@@ -1057,6 +1116,8 @@ class NNXDecoder(nnx.Module):
       forced_routed_experts_scanned: Optional `[length, ...]` array, one slice
         per scan iteration, threaded through jax.lax.scan's xs alongside
         params/state and passed to each layer as `forced_routed_experts=`.
+      scanned_kwargs: Optional dict of `[length, ...]` arrays, sliced the same
+        way and passed to each layer as keyword arguments (debug replays).
       **kwargs: Keyword args forwarded to the layer (filtered by the layer
         signature).
 
@@ -1094,10 +1155,17 @@ class NNXDecoder(nnx.Module):
 
     use_kv = kv_caches_stacked is not None
     use_forced_routing = forced_routed_experts_scanned is not None
+    use_scanned_kwargs = bool(scanned_kwargs)
+    if use_scanned_kwargs and use_kv:
+      raise NotImplementedError("scanned_kwargs are not supported together with external kv_caches.")
 
     def layer_fn(carry, scanned_vars):
       # Ensure metadata rank matches the sliced values
       scanned_vars = maxtext_utils_nnx.nnx_remove_scan_axis(scanned_vars, "layers")
+      extra_layer_kwargs = {}
+      if use_scanned_kwargs:
+        *scanned_vars, extra_layer_kwargs = scanned_vars
+        scanned_vars = tuple(scanned_vars)
 
       # Unpack the sliced variables for THIS layer
       if use_kv:
@@ -1125,6 +1193,7 @@ class NNXDecoder(nnx.Module):
         call_kwargs["kv_cache"] = kv_cache_layer
       if use_forced_routing:
         call_kwargs["forced_routed_experts"] = forced_routed_experts_layer
+      call_kwargs.update(extra_layer_kwargs)
 
       layer_out = layer(carry, *args, **call_kwargs)
 
@@ -1192,6 +1261,8 @@ class NNXDecoder(nnx.Module):
         scan_xs = (params, state, forced_routed_experts_scanned)
       else:
         scan_xs = (params, state)
+      if use_scanned_kwargs:
+        scan_xs = scan_xs + (dict(scanned_kwargs),)
       final_carry, scanned_state = jax.lax.scan(layer_fn_wrapped, x_in, scan_xs, unroll=unroll)
       returned_kv_stacked = None
 
@@ -1381,6 +1452,12 @@ class NNXDecoder(nnx.Module):
         )
       elif remat_policy == "save_out_proj":
         policy = jax.checkpoint_policies.save_only_these_names("out_proj")
+      elif remat_policy == "save_everything":
+        # Save every intermediate of the forward pass for the backward pass (complex values, e.g. complex RoPE, are
+        # recomputed; see save_everything_except_complex), at the highest HBM cost. Useful as a numerics reference.
+        # jax.checkpoint rounds every saved residual to its dtype (reduce_precision), so with XLA excess precision
+        # the forward values can differ slightly from remat_policy=full.
+        policy = save_everything_except_complex
       else:
         assert remat_policy == "full", "Remat policy needs to be on list of remat policies"
         policy = None
@@ -1415,6 +1492,9 @@ class NNXDecoder(nnx.Module):
           RMSNorm,
           num_features=num_features,
           shard_mode=self.config.shard_mode,
+          single_rounding=getattr(self.config, "rmsnorm_single_rounding", False),
+          scale_grad_fp32=getattr(self.config, "rmsnorm_scale_grad_fp32", False),
+          scale_grad_gpu_order=getattr(self.config, "rmsnorm_scale_grad_gpu_order", False),
           rngs=rngs,
       )
     elif self.config.decoder_block == DecoderBlockType.GPT3:
@@ -1759,13 +1839,17 @@ class NNXDecoder(nnx.Module):
       multimodal_input: None | MultimodalInput = None,
       forced_routed_experts: jnp.ndarray | None = None,
       decoder_input_embeddings=None,
+      forced_indexer_topk: jnp.ndarray | None = None,
   ):
     cfg = self.config
     assert decoder_input_tokens.ndim == 2  # [batch, len]
 
+    replay_deepseek = forced_routed_experts is not None and self._check_forced_routing_deepseek(forced_routed_experts)
+    if forced_indexer_topk is not None:
+      self._check_forced_indexer_topk(forced_indexer_topk)
     if forced_routed_experts is not None:
-      check_forced_routing_support(cfg.decoder_block)
-      if getattr(cfg, "mtp_num_layers", 0) > 0:
+      check_forced_routing_support(cfg.decoder_block, allow_deepseek=replay_deepseek)
+      if getattr(cfg, "mtp_num_layers", 0) > 0 and not replay_deepseek:
         # The MTP side-car reuses the decoder layer blueprint but is invoked
         # separately, so it would re-route freely while the main stack replays.
         raise NotImplementedError(
@@ -1809,6 +1893,9 @@ class NNXDecoder(nnx.Module):
       if cfg.mhc_expansion_rate > 1:
         # (batch, length, emb_dim) --> (batch, length, mhc_expansion_rate, emb_dim)
         y = mhc_expand(y)
+        if mhc.streams_flat(cfg):
+          # (batch, length, k, emb) --> (batch, length, k * emb); see mhc.streams_flat.
+          y = jnp.reshape(y, y.shape[:2] + (-1,))
 
     layer_args = (decoder_segment_ids, decoder_positions, deterministic, model_mode)
 
@@ -2004,11 +2091,24 @@ class NNXDecoder(nnx.Module):
             if lineage_bias_updates is not None:
               self.sow(nnx.Intermediate, "moe_bias_updates", lineage_bias_updates)
           else:
+            # Router replay (debug_forced_routing_deepseek): dense layers take none, MoE layers get per-layer slices.
+            fre_moe = None
+            if replay_deepseek:
+              fre_all = layer_kwargs.pop("forced_routed_experts")
+              fre_moe = fre_all[:, :, cfg.first_num_dense_layers : cfg.num_decoder_layers]
+              fre_moe = jnp.moveaxis(fre_moe, 2, 0)  # [num_moe, batch, seq, top_k]
+            # Indexer top-k replay (debug_forced_indexer_topk): per-layer slices, [layers, batch, seq, indexer_topk].
+            fit_dense, fit_moe = None, None
+            if forced_indexer_topk is not None:
+              fit_all = jnp.moveaxis(forced_indexer_topk[:, :, : cfg.num_decoder_layers], 2, 0)
+              fit_dense = {"forced_indexer_topk": fit_all[: cfg.first_num_dense_layers]}
+              fit_moe = fit_all[cfg.first_num_dense_layers :]
             y, self.dense_layers, _ = self._apply_layers_sequentially(
                 self.dense_layers,
                 y,
                 *layer_args,
                 length=cfg.first_num_dense_layers,
+                scanned_kwargs=fit_dense,
                 **layer_kwargs,
             )
 
@@ -2040,12 +2140,16 @@ class NNXDecoder(nnx.Module):
                     cfg=cfg,
                     num_layers=num_moe,
                 )
+            elif cfg.use_indexer and cfg.indexer_share_interval > 1:
+              y = self._apply_deepseek_index_cache_blocks(y, num_moe, layer_args, layer_kwargs, fre_moe, fit_moe)
             else:
               y, self.moe_layers, _ = self._apply_layers_sequentially(
                   self.moe_layers,
                   y,
                   *layer_args,
                   length=num_moe,
+                  forced_routed_experts_scanned=fre_moe,
+                  scanned_kwargs=None if fit_moe is None else {"forced_indexer_topk": fit_moe},
                   **layer_kwargs,
               )
 
@@ -2288,7 +2392,9 @@ class NNXDecoder(nnx.Module):
 
     # After the final transformer layer, `y` holds the raw, un-normalized hidden state.
     if getattr(cfg, "mhc_expansion_rate", 1) > 1:
-      if cfg.decoder_block == DecoderBlockType.DEEPSEEK4:
+      if y.ndim == 3:  # flat streams (use_ihc_pallas_kernel)
+        y = jnp.reshape(y, y.shape[:2] + (cfg.mhc_expansion_rate, -1))
+      if self.use_hc_head:
         hidden_state = self.hc_head(y)
       else:
         # (batch, length, mhc_expansion_rate, emb_dim) --> (batch, length, emb_dim)
@@ -2564,6 +2670,86 @@ class NNXDecoder(nnx.Module):
       )
 
     return y
+
+  def _apply_deepseek_index_cache_blocks(self, y, num_moe, layer_args, layer_kwargs, fre_moe=None, fit_moe=None):
+    """Applies the scanned IndexCache MoE blocks, then the remainder block if any.
+
+    Both rematerialize their sub-layers internally. Unlike `_apply_remainder_block` the remainder keeps the
+    block's Intermediates: they carry its MoE router-bias updates, load-balance losses and QK-Clip max_logits.
+    fre_moe: router replay for the MoE layers, [num_moe, batch, seq, top_k] (debug_forced_routing_deepseek).
+    fit_moe: indexer top-k replay for the MoE layers, [num_moe, batch, seq, indexer_topk] (debug_forced_indexer_topk).
+    """
+    cfg = self.config
+    block_length = cfg.indexer_share_interval
+    num_blocks = num_moe // block_length
+
+    def blocks(x):
+      return x[: num_blocks * block_length].reshape((num_blocks, block_length) + x.shape[1:])
+
+    fre_scanned = None if fre_moe is None else blocks(fre_moe)
+    y, self.moe_layers, _ = self._apply_layers_sequentially(
+        self.moe_layers,
+        y,
+        *layer_args,
+        length=num_blocks,
+        skip_block_remat=True,
+        forced_routed_experts_scanned=fre_scanned,
+        scanned_kwargs=None if fit_moe is None else {"forced_indexer_topk": blocks(fit_moe)},
+        **layer_kwargs,
+    )
+    if num_moe % block_length:
+      call_kwargs = dict(zip(("decoder_segment_ids", "decoder_positions", "deterministic", "model_mode"), layer_args))
+      call_kwargs.update(layer_kwargs)
+      if fre_moe is not None:
+        call_kwargs["forced_routed_experts"] = fre_moe[num_blocks * block_length :]
+      if fit_moe is not None:
+        call_kwargs["forced_indexer_topk"] = fit_moe[num_blocks * block_length :]
+      params = inspect.signature(deepseek.DeepSeekIndexCacheMoEBlock.__call__).parameters
+      out = self.moe_layers_remainder(y, **{k: v for k, v in call_kwargs.items() if k in params})
+      y = out[0] if isinstance(out, tuple) else out
+    return y
+
+  def _check_forced_routing_deepseek(self, forced_routed_experts) -> bool:
+    """True when debug_forced_routing_deepseek replays routing on a DeepSeek decoder; checks the supported path.
+
+    forced_routed_experts: [batch, seq, num_decoder_layers + mtp_num_layers, top_k]; dense-layer slots are ignored.
+    """
+    cfg = self.config
+    if not (getattr(cfg, "debug_forced_routing_deepseek", False) and self.is_deepseek):
+      return False
+    if not cfg.scan_layers or cfg.engram_layers or cfg.use_lineage or cfg.use_batch_split_schedule:
+      raise NotImplementedError(
+          "debug_forced_routing_deepseek supports only the scanned DeepSeek path without engram, lineage or"
+          " batch-split schedule."
+      )
+    want = cfg.num_decoder_layers + getattr(cfg, "mtp_num_layers", 0)
+    if forced_routed_experts.ndim != 4 or forced_routed_experts.shape[2] != want:
+      raise ValueError(
+          "debug_forced_routing_deepseek: forced_routed_experts must be [batch, seq, num_decoder_layers +"
+          f" mtp_num_layers = {want}, top_k]; got {forced_routed_experts.shape}."
+      )
+    return True
+
+  def _check_forced_indexer_topk(self, forced_indexer_topk) -> None:
+    """debug_forced_indexer_topk: checks the switch, the supported path and the shape."""
+    cfg = self.config
+    if not getattr(cfg, "debug_forced_indexer_topk", False):
+      raise NotImplementedError("forced_indexer_topk needs debug_forced_indexer_topk=true.")
+    if not self.is_deepseek or not cfg.use_indexer:
+      raise NotImplementedError("debug_forced_indexer_topk supports only decoder_block deepseek with use_indexer.")
+    if not cfg.scan_layers or cfg.engram_layers or cfg.use_lineage or cfg.use_batch_split_schedule:
+      raise NotImplementedError(
+          "debug_forced_indexer_topk supports only the scanned DeepSeek path without engram, lineage or"
+          " batch-split schedule."
+      )
+    want = cfg.num_decoder_layers + getattr(cfg, "mtp_num_layers", 0)
+    if forced_indexer_topk.ndim != 4 or forced_indexer_topk.shape[2] != want or (
+        forced_indexer_topk.shape[3] != cfg.indexer_topk
+    ):
+      raise ValueError(
+          "debug_forced_indexer_topk: forced_indexer_topk must be [batch, seq, num_decoder_layers + mtp_num_layers ="
+          f" {want}, indexer_topk = {cfg.indexer_topk}]; got {forced_indexer_topk.shape}."
+      )
 
   def _apply_remainder_block(
       self,

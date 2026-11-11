@@ -501,7 +501,11 @@ def _build_single_axis_stacked_tensor(
   axis_to_stack = 0
   if config.scan_layers:
     is_var_collection = "MoEBiasVar" in mt_key or "Tid2EidVar" in mt_key
-    is_unscanned_moe = "MoeBlock" in mt_key and "scanned_blocks" not in mt_key
+    # Hy4 stores the routed experts fused per layer (experts.gate_up_proj [E, 2I, D]), so each of its MoE sources is
+    # one tensor per scanned layer and stacks along the scan axis like any other layer weight.
+    is_unscanned_moe = (
+        "MoeBlock" in mt_key and "scanned_blocks" not in mt_key and not config.model_name.startswith("hy4")
+    )
     if not (is_var_collection or is_unscanned_moe):
       # If the target tensor rank exceeds param_scan_axis (e.g., multidimensional weights or 2D block scales),
       # stack along param_scan_axis (typically axis 1 in scanned layers). For 1D tensors (e.g., per-layer scalar

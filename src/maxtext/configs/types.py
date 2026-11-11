@@ -30,7 +30,16 @@ import yaml
 from typing import Any, Literal, NewType, Optional
 
 import jax
-from maxtext.common.common_types import AttentionType, DecoderBlockType, ReorderStrategy, ShardMode, CustomRule, VisionEncoderBlockType
+from maxtext.common.common_types import (
+    AttentionType,
+    CustomRule,
+    DecoderBlockType,
+    PLAIN_CAUSAL_ATTENTION_TYPES,
+    ReorderStrategy,
+    SPLASH_STATIC_CAUSAL_TOKAMAX_HELPERS,
+    ShardMode,
+    VisionEncoderBlockType,
+)
 from maxtext.utils import gcs_utils
 from maxtext.utils import max_logging
 from maxtext.utils import max_utils
@@ -145,6 +154,7 @@ class RematPolicy(str, Enum):
   CUSTOM = "custom"
   MINIMAL_OFFLOADED = "minimal_offloaded"
   SAVE_OUT_PROJ = "save_out_proj"
+  SAVE_EVERYTHING = "save_everything"
 
 
 class RematLocation(str, Enum):
@@ -254,6 +264,10 @@ ModelName = Literal[
     "deepseek3.2-671b",
     "deepseek4-tiny",
     "deepseek4-284b",
+    "hy4-preview",
+    "hy4-tiny",
+    "hy4-mini",
+    "hy4-mid",
     "deepseek-custom",
     "kimi-k2-1t",
     "gemma-7b",
@@ -508,6 +522,85 @@ class DataTypes(BaseModel):
       False,
       description="If True, sets activations to float32 before the nonlinearity.",
   )
+  rmsnorm_single_rounding: bool = Field(
+      False,
+      description=(
+          "If True, RMSNorm computes x * rsqrt(mean(x^2) + eps) * scale in float32 and rounds to `dtype` once"
+          " (as fused GPU RMSNorm kernels do). If False, the normalized value is rounded to `dtype` before the"
+          " multiply by the `dtype` scale, i.e. two roundings."
+      ),
+  )
+  mlp_activation_round_per_op: bool = Field(
+      False,
+      description=(
+          "If True, the gated MLP activation (dense MLP, shared and routed experts) computes each op in float32"
+          " and rounds its output to `dtype`: dtype(dtype(act(float32(gate))) * up). This is what an eager framework"
+          " computes on `dtype` tensors. Takes precedence over activations_in_float32 for the activation."
+      ),
+  )
+  dense_fp32_accumulation: bool = Field(
+      False,
+      description=(
+          "If True, DenseGeneral (attention projections incl. the MLA wq_a/wq_b/wkv_a/wkv_b/out and the gated"
+          " attention gate_proj, dense MLP and shared experts, the MTP projection) runs its dot_general with"
+          " preferred_element_type=float32 and rounds to `dtype` once. When the contracted axis is fsdp-sharded,"
+          " XLA may lower the dot to a windowed (collective) matmul that otherwise accumulates per-shard partial"
+          " products in `dtype`."
+      ),
+  )
+  rmsnorm_scale_grad_fp32: bool = Field(
+      False,
+      description=(
+          "If True (only with rmsnorm_single_rounding), RMSNorm rounds its scale to `dtype` with a straight-through"
+          " gradient: the forward pass is unchanged, and the scale gradient (a sum over all tokens) stays float32."
+          " Without it, JAX transposes reduce_precision as a linear op and rounds the scale gradient to `dtype`."
+      ),
+  )
+  rmsnorm_scale_grad_gpu_order: bool = Field(
+      False,
+      description=(
+          "If True (only with rmsnorm_single_rounding; takes precedence over rmsnorm_scale_grad_fp32), the RMSNorm"
+          " scale gradient is summed over each batch row (sequence) in float32, rounded once to `dtype`, then summed"
+          " over rows in float32: the order of TE's fused RMSNorm dgamma (written in the bf16 parameter dtype once"
+          " per micro-batch) plus Megatron's float32 main_grad, when each rank's micro-batch is one sequence."
+          " Forward pass unchanged."
+      ),
+  )
+  logits_dense_wgrad_fp32: bool = Field(
+      False,
+      description=(
+          "If True, the output head (logits_dense) feeds its float32 kernel, rounded to `dtype` values with a"
+          " straight-through gradient, into a float32-accumulating dot and rounds the logits to `dtype` once. The"
+          " forward pass is unchanged and the kernel gradient (wgrad) stays float32 instead of being produced in"
+          " `dtype` (the all-gather of the kernel then moves float32 bytes). With logits_dot_in_fp32 the head"
+          " already computes in float32 and this has no effect."
+      ),
+  )
+  embedding_grad_fp32: bool = Field(
+      False,
+      description=(
+          "If True, the token embedding gathers rows from the float32 table and casts them to `dtype` (bitwise the"
+          " same as casting the table first), so the backward scatter-add accumulates in float32 instead of `dtype`."
+      ),
+  )
+  embedding_grad_fp32_local_bf16_comm: bool = Field(
+      False,
+      description=(
+          "If True (takes precedence over embedding_grad_fp32), the token-embedding gradient is scatter-added in"
+          " float32 on each device, rounded to bfloat16 once, and summed across the data-parallel devices in"
+          " bfloat16: float32 local accumulation without float32 communication. Forward unchanged."
+      ),
+  )
+  embedding_shard_over_data: bool = Field(
+      False,
+      description=(
+          "If True, only the token-embedding table is additionally sharded over the 'data' mesh axis: its hidden"
+          " dimension uses the logical axis 'embed_vocab_table', mapped to 'data' followed by the axes of"
+          " 'embed_vocab'. Every other parameter keeps its sharding. Under pure data parallelism the compiler then"
+          " partitions this one parameter the way FSDP does: the backward exchanges the raw per-token gradient"
+          " columns and token ids instead of summing a locally scatter-added full-table gradient."
+      ),
+  )
   dtype_mm: str = Field("float32", description="Data type for multimodal model's vision encoder")
 
 
@@ -679,9 +772,19 @@ class MTP(BaseModel):
   """Multi-Token Prediction Configs."""
 
   mtp_num_layers: NonNegativeInt = Field(0, description="The number of auxiliary prediction layers to use for MTP.")
+  mtp_loss_mcore_per_rank: bool = Field(
+      False,
+      description=(
+          "If True, each row (= device, one row per device per microbatch) rescales its MTP loss by its own original /"
+          " rolled token counts (Megatron-Core calculate_per_token_loss). Off: one ratio over the whole microbatch."
+      ),
+  )
   mtp_loss_scaling_factor: NonNegativeFloat = Field(
       0.1,
       description="The scaling factor (lambda) for the MTP auxiliary loss.",
+  )
+  mtp_input_post_final_norm: bool = Field(
+      False, description="Feed MTP the main model's hidden state after the final norm (decoder_norm) instead of before."
   )
   mtp_eval_target_module: NonNegativeInt = Field(
       0,
@@ -702,6 +805,17 @@ class LogitsAndLoss(BaseModel):
       description="If logits_via_embedding is true, normalize pre-softmax logits.",
   )
   logits_dot_in_fp32: bool = Field(False, description="Use fp32 for the logits dot product for stability.")
+  logits_matmul_precision: Literal["", "default", "high", "highest", "bfloat16", "float32"] = Field(
+      "",
+      description=(
+          "Matmul precision of the output head only (logits_dense, or the tied-embedding logits; the MTP head reuses"
+          " logits_dense). Empty follows matmul_precision for logits_dense and keeps the backend default for the"
+          " tied-embedding dot. On TPU a float32 matmul at 'default' runs as one bfloat16 pass, so"
+          " logits_dot_in_fp32 alone does not compute the head in float32; logits_dot_in_fp32=True plus 'highest'"
+          " here does, without raising the precision of every other matmul. The tied-embedding dot keeps its"
+          " bfloat16 operands (attend_on_embedding casts the table to bfloat16), so there it only sets the precision."
+      ),
+  )
   cast_logits_to_fp32: bool = Field(True, description="Whether to cast the final logits to fp32.")
   final_logits_soft_cap: None | NonNegativeFloat = Field(
       None,
@@ -789,6 +903,99 @@ class Attention(BaseModel):
   force_q_layout: bool = Field(False, description="Force the Q layout")
   use_qk_clip: bool = Field(False, description="Whether to use QK-Clip (MuonClip) for training stability.")
   qk_clip_threshold: float = Field(100.0, description="Threshold for QK-Clip (tau).")
+  qk_clip_mcore_denominator: bool = Field(
+      False,
+      description="If True, the QK-Clip scale is min(1, tau / max_logit) (Megatron-Core). Off: tau / (max_logit + 1e-6).",
+  )
+  qk_clip_max_logit_exclude_sink: bool = Field(
+      False,
+      description=(
+          "If True, the QK-Clip max logit under TPU flash attention with attention sinks is the max of the scaled"
+          " q.k over the attended positions only, recomputed outside the kernel (Megatron-Core and HF leave the sink"
+          " out). Off: the splash kernel's running max, which starts from the sink, so it is max(sink, max q.k)."
+          " Costs one [batch, heads, q_len, kv_len] float32 score tensor per attention layer."
+      ),
+  )
+  transcendental_accuracy_highest: bool = Field(
+      False,
+      description=(
+          "If True, float32 exp / log / sigmoid / silu at accuracy=HIGHEST (lax AccuracyMode) where Hy4 computes"
+          " them outside the attention kernel: the indexer KD softmax / log_softmax / log, the MLA output-gate sigmoid,"
+          " the iHC pre / post gates and hc_head, the router sigmoid, the MLP / expert silu, and the cross entropy of"
+          " the main and MTP losses. TPU's default float32"
+          " versions are approximations (JAX 'Numerical accuracy': up to 109.5 / 62 / 124 ULP for exp / log / logistic"
+          " on v5p). Off: the default jax functions. The sigmoid / silu sites can be set one by one with the"
+          " accurate_<site> overrides below."
+      ),
+  )
+  transcendental_log_freebsd: bool = Field(
+      False,
+      description=(
+          "If True (and transcendental_accuracy_highest is on), the float32 log at the accurate sites (indexer KD"
+          " log / log_softmax, the log-sum-exp of the main and MTP cross entropy) goes through a float32 port of"
+          " FreeBSD msun e_logf.c with an exact division: at most 1 ULP (as CUDA logf) instead of 3 ULP for lax.log"
+          " at accuracy=HIGHEST on TPU v5p. The derivative stays t / x (bit-identical gradients in the CPU unit tests);"
+          " on TPU the program compiles differently, and on hy4-mini step 1 ten indexer gradient tensors (layer 5 and"
+          " MTP) moved by up to 2.3e-4 relative. Off: lax.log at accuracy=HIGHEST."
+      ),
+  )
+  accurate_sigmoid_ihc: bool | None = Field(
+      None,
+      description=(
+          "Per-site override for the iHC pre / post gate sigmoid: True = accurate float32 (utils/accurate_math.py),"
+          " False = the jax default, None = follow transcendental_accuracy_highest."
+      ),
+  )
+  accurate_sigmoid_hc_head: bool | None = Field(
+      None,
+      description=(
+          "Per-site override for the hc_head gate sigmoid: True = accurate float32 (utils/accurate_math.py),"
+          " False = the jax default, None = follow transcendental_accuracy_highest."
+      ),
+  )
+  accurate_sigmoid_router: bool | None = Field(
+      None,
+      description=(
+          "Per-site override for the router score sigmoid: True = accurate float32 (utils/accurate_math.py),"
+          " False = the jax default, None = follow transcendental_accuracy_highest."
+      ),
+  )
+  accurate_sigmoid_attn_gate: bool | None = Field(
+      None,
+      description=(
+          "Per-site override for the MLA output-gate sigmoid: True = accurate float32 (utils/accurate_math.py),"
+          " False = the jax default, None = follow transcendental_accuracy_highest."
+      ),
+  )
+  accurate_silu_dense: bool | None = Field(
+      None,
+      description=(
+          "Per-site override for the dense-layer MLP silu: True = accurate float32 (utils/accurate_math.py),"
+          " False = the jax default, None = follow transcendental_accuracy_highest."
+      ),
+  )
+  accurate_silu_shared: bool | None = Field(
+      None,
+      description=(
+          "Per-site override for the shared-expert silu: True = accurate float32 (utils/accurate_math.py),"
+          " False = the jax default, None = follow transcendental_accuracy_highest."
+      ),
+  )
+  accurate_silu_routed: bool | None = Field(
+      None,
+      description=(
+          "Per-site override for the routed-expert silu: True = accurate float32 (utils/accurate_math.py),"
+          " False = the jax default, None = follow transcendental_accuracy_highest."
+      ),
+  )
+  qk_clip_log_per_head: bool = Field(
+      False,
+      description=(
+          "If True (with use_qk_clip), train_step also returns metrics['qk_clip_per_head']: for every attention"
+          " module that QK-Clip touches, the per-(layer,) head max logit and the scale it applies, stacked as"
+          " [2, (layers,) heads]. Logging only; the clip itself is unchanged."
+      ),
+  )
   mla_qk_head_chunk_size: int = Field(
       0,
       ge=0,
@@ -824,6 +1031,20 @@ class MlaAttention(BaseModel):
   qk_nope_head_dim: NonNegativeInt = Field(128, description="Dimension for non-RoPE part of QK heads in MLA.")
   qk_rope_head_dim: NonNegativeInt = Field(64, description="Dimension for RoPE part of QK heads in MLA.")
   v_head_dim: NonNegativeInt = Field(128, description="Dimension of V heads in MLA.")
+  mla_lora_norm_epsilon: float = Field(
+      -1.0,
+      description=(
+          "Epsilon of the RMS norms on the MLA query / key-value low-rank latents. "
+          "Negative means use normalization_layer_epsilon."
+      ),
+  )
+  attention_output_gate: Optional[Literal["elementwise"]] = Field(
+      None,
+      description=(
+          "MLA output gate; None disables it. 'elementwise': out = attention_out * sigmoid(gate_proj(x)) per head and per value "
+          "channel, where x is the attention input, applied before the output projection (Hy4 gated MLA)."
+      ),
+  )
   use_sliced_mla_proj: bool = Field(
       False,
       description=(
@@ -869,17 +1090,91 @@ class AttentionIndexer(BaseModel):
       False,
       description="Determines the training strategy for the indexer: Dense Warm-up or Sparse Training stage.",
   )
+  debug_sow_indexer: bool = Field(
+      False,
+      description="Diagnostics: sow the first batch row of the indexer KD teacher / student inputs (no effect on math).",
+  )
+  log_indexer_loss_per_layer: bool = Field(
+      False,
+      description=(
+          "Diagnostics: also log each indexer-producing layer's KD loss as learning/indexer_loss_layer_<i> (i in the"
+          " order the per-layer losses are collected; learning/indexer_loss stays their mean). No effect on math."
+      ),
+  )
+  indexer_weights_proj_bf16_weight: bool = Field(
+      False,
+      description=(
+          "If True, the indexer weights_proj multiplies the BF16-rounded weight (straight-through gradient) and keeps"
+          " the FP32 output, as Megatron-Core's _DSAWeightsProjection (BF16 operands, FP32 output). Off: the FP32"
+          " master weight is used as is."
+      ),
+  )
+  indexer_fp32_scores: bool = Field(
+      False,
+      description=(
+          "If True, the indexer runs in true FP32 like Megatron-Core: weights_proj at HIGHEST precision, q.k and the head"
+          " weighting with FP32 operands at HIGHEST precision, and the KD teacher q.k likewise. Off: config"
+          " matmul_precision with the compute dtype (on TPU one BF16 pass, per-head logits rounded to BF16)."
+      ),
+  )
+  indexer_kd_mcore_log: bool = Field(
+      False,
+      description=(
+          "If True, the indexer KL loss uses Megatron-Core's form: p / max(sum p, 1e-10), exact log_softmax for the"
+          " indexer, log(max(p, 1e-10)) for the target, terms with p == 0 left out. Off: log(p + 1e-8) - log(q + 1e-8)."
+      ),
+  )
+  indexer_kd_generalized_kl: bool = Field(
+      False,
+      description=(
+          "If True, the recorded indexer KL loss value is the generalized KL sum(p log(p/q) - p + q), which is"
+          " first-order insensitive to the FP32 row-sum error of p and to a uniform shift of log q. Gradients are"
+          " unchanged (the difference to the KL goes through stop_gradient). Off: the KL itself."
+      ),
+  )
   indexer_loss_scaling_factor: float = Field(0.0, description="Multiplier for the indexer KL divergence loss.")
+  indexer_kd_mcore_weight: bool = Field(
+      False,
+      description=(
+          "If True, the indexer KL loss is weighted by the number of query rows of the microbatch over the global"
+          " valid-token count (Megatron-Core calculate_per_token_loss). Off: by the microbatch's valid tokens."
+      ),
+  )
   indexer_use_approx_top_k: bool = Field(
       False, description="Whether to use approximate top-k selection for the indexer on TPU."
   )
   indexer_approx_top_k_recall: float = Field(0.95, description="Recall target for approximate top-k selection.")
+  indexer_kth_select: bool = Field(
+      False,
+      description=(
+          "MLA (DeepSeek Sparse Attention) indexer only: find the cutoff (the k-th largest score) with a bitwise"
+          " select (one pass per key bit) instead of jax.lax.top_k. Same mask as top_k for NaN-free scores; top-k"
+          " indices are not produced. The compressed-attention (CSA) indexer ignores it."
+      ),
+  )
   indexer_mask_exact_topk: bool = Field(
       True,
       description=(
           "When True, enforces that exactly k elements are unmasked by the indexer under boundary ties."
           " When False, uses raw thresholding which is faster but may unmask > k elements"
           " during ties."
+      ),
+  )
+  indexer_rope_position: Literal["first", "last"] = Field(
+      "first",
+      description="Which end of the indexer head dim carries RoPE: 'first' [rope, nope] (DeepSeek-V3.2), 'last' [nope, rope] (Hy4).",
+  )
+  indexer_k_norm_epsilon: float = Field(1e-6, description="Epsilon of the indexer key LayerNorm.")
+  indexer_rope_interleave: bool = Field(
+      False,
+      description="Indexer q_pe / k_pe input layout: concatenated (False, DeepSeek-V3.2; Hy4-preview after"
+      " checkpoint_rope_interleave conversion) or interleaved pairs (2i, 2i+1) (True).",
+  )
+  indexer_share_interval: PositiveInt = Field(
+      1,
+      description=(
+          "DSA IndexCache: MoE layers form groups of this size in which only the first layer runs an indexer and"
+          " the rest reuse its top-k mask (Hy4: 4). 1 gives every layer its own indexer. Scanned DeepSeek only."
       ),
   )
 
@@ -1004,6 +1299,17 @@ class SplashAttention(BaseModel):
       0,
       description="the number of reduction steps. For now, only 3 or all the kv steps are supported.",
   )
+  splash_static_causal_partial_mask: bool = Field(
+      False,
+      description=(
+          "Tokamax splash with a DSA indexer mask (MLA): schedule blocks with the static causal pattern and apply the"
+          " indexer mask as per-block tiles, instead of make_dynamic_splash_mha, whose batch-dependent schedule makes"
+          " jax.vmap run one kernel per batch element. Needs use_indexer (so attention_type 'mla'), attention 'flash'"
+          " or 'autoselected' with use_tokamax_splash, no multimodal, and splash blocks dividing max_target_length;"
+          " context parallelism, inference modes and chunked prefill keep the dynamic path. Without attention sinks,"
+          " rows with no selected key after the segment fold can differ (see static_causal_partial_mask_splash)."
+      ),
+  )
 
 
 class MoEGeneral(BaseModel):
@@ -1027,6 +1333,16 @@ class MoEGeneral(BaseModel):
           " 'step': roll the step's update back in-graph and replay the whole train step with a dropless buffer."
           " 'layer': per MoE layer, calculate the overflow from the router's top-k and take a chunked dropless"
           " branch (lax.cond) for that layer only; no step replay."
+      ),
+  )
+  moe_dropless_retry: bool = Field(
+      True,
+      description=(
+          "With moe_dropless_fallback='step': build the dropless program and replay an overflowing step with it."
+          " False: build no dropless program and no in-graph rollback; on an overflowing train step training stops"
+          " with an error before the step is checkpointed. For configurations whose dropless program does not fit in"
+          " HBM: every train step that completes is dropless. An overflowing eval step only logs an error (its"
+          " metrics include dropped tokens)."
       ),
   )
   retry_dropless_first_steps: int = Field(
@@ -1180,6 +1496,101 @@ class MoEGeneral(BaseModel):
       False,
       description="Whether to use ragged kernel for sorting, improve performance when EP is enabled.",
   )
+  mlp_fused_fc1_dgrad: bool = Field(
+      False,
+      description=(
+          "Input gradient of the two SwiGLU up projections (wi_0 = gate, wi_1 = up) as one product [g0 | g1] [w0 |"
+          " w1]^T accumulated in float32 and rounded once, as Megatron-Core's fused linear_fc1, instead of each"
+          " projection's input gradient rounded on its own and then added. Dense MlpBlock and shared experts: a"
+          " custom VJP on the two outputs (forward and kernel gradients unchanged); routed experts (sparse_matmul):"
+          " the up projection runs as one GMM on the concatenated [w0 | w1] (as prefuse_moe_weights, weights stored"
+          " apart). No quantization."
+      ),
+  )
+  splash_dsinks_fp32: bool = Field(
+      False,
+      description=(
+          "tokamax splash attention: compute the attention-sink gradient as -sum_q exp(sink - lse) * (o . do) in"
+          " float32 (kernels/splash_dsinks_fp32.py), as Megatron-Core's autograd through the float32 softmax does."
+          " Off: tokamax's backward, which rounds every term and the sum to the attention dtype (bf16)."
+      ),
+  )
+  splash_dsinks_gpu_order: bool = Field(
+      False,
+      description=(
+          "tokamax splash with the DSA indexer mask: the attention-sink gradient in Megatron-Core's order,"
+          " -sum_q p_sink * sum_j p_j * bf16(do . v_j) with the scores, p and the sums in float32, recomputed outside"
+          " the kernel in the backward (kernels/splash_dsinks_gpu_order.py; one dense attention-sized recompute per"
+          " layer). The kernel's own sink gradient is dropped; output, dq, dk, dv are unchanged. Takes precedence over"
+          " splash_dsinks_fp32 for the sink gradient."
+      ),
+  )
+  debug_capture_choices: bool = Field(
+      False,
+      description=(
+          "Diagnostics only, numerics unchanged: every routed MoE sows its own top-k expert ids"
+          " (captured_routed_experts) and its biased router scores (captured_router_scores), on the global arrays;"
+          " every layer that runs its own DSA indexer sows its top-k key positions (captured_indexer_topk, -1 where"
+          " the position is masked). With a replay switch on, the replayed layer sows nothing for that choice."
+      ),
+  )
+  debug_forced_routing_deepseek: bool = Field(
+      False,
+      description=(
+          "Diagnostics only: allow router replay (data key forced_routed_experts, [batch, seq, layers, top_k] with"
+          " layers = num_decoder_layers + mtp_num_layers; dense-layer slots are ignored) on decoder_block deepseek,"
+          " including IndexCache blocks and the MTP layers. Only the expert ids are replayed; the weights are"
+          " gathered from the pre-bias scores and normalized as in DeepSeek routing. Each routed MoE sows the ids it"
+          " used (forced_routing_used) and the fraction of tokens whose own top-k set agrees"
+          " (forced_routing_natural_agree)."
+      ),
+  )
+  debug_forced_indexer_topk: bool = Field(
+      False,
+      description=(
+          "Diagnostics only: replay the DSA indexer top-k selection (data key forced_indexer_topk, [batch, seq,"
+          " num_decoder_layers + mtp_num_layers, indexer_topk] key positions, -1 = unused; only the slots of layers"
+          " that run their own indexer are read) on decoder_block deepseek: the indexer still computes its scores"
+          " (and its KD loss) but the attention and KD mask is built from the given positions. Each such layer sows"
+          " forced_indexer_index_sum (per query, the sum of the selected positions, to check against the input) and"
+          " forced_indexer_natural_agree (the fraction of queries whose own top-k set is the same)."
+      ),
+  )
+  debug_routing_digest: bool = Field(
+      False,
+      description=(
+          "Diagnostics only: record every routed top-k selection on the host through jax.debug.callback"
+          " (utils/routing_debug.py), to count how many (token, expert) slots a rematerialized backward re-selects."
+      ),
+  )
+  moe_mcore_prob_before_fc2: bool = Field(
+      False,
+      description=(
+          "sparse_matmul without expert parallelism or ring of experts: apply the routing weight before the routed"
+          " experts' down projection, as Megatron-Core (SwiGLU output in the activation dtype x float32 probability,"
+          " promoted to float32, rounded once), and combine the top-k outputs unweighted, added one at a time in the"
+          " activation dtype (Megatron-Core's scatter_add_ unpermute). Off: the weights multiply the wo outputs in"
+          " the unpermute weight sum."
+      ),
+  )
+  moe_router_grad_from_wo_input: bool = Field(
+      False,
+      description=(
+          "Ring of Experts with the ragged sort: run the routed experts' down projection (wo GMM) and the unsort as"
+          " one op whose backward does not read the wo GMM's output. The routing-weight gradient <g, h wo> is"
+          " computed as <g wo^T, h> from the wo GMM's input and the routing weight is applied on the [rows, mlp]"
+          " side (dwo = (w * h)^T g, dh = w * (g wo^T)), so a rematerialized layer no longer recomputes the wo GMM"
+          " in the backward. The forward is bit-identical. NUMERICS CHANGE: each gradient keeps one rounding to the"
+          " activation dtype but at a different point, so the gradients agree with the unfused ops to bf16"
+          " rounding, not bit for bit. The saving needs the layer's backward not to replay its output: with an op"
+          " after the MoE block that reads the MoE output in the backward (moe_out=remat on such a block), the"
+          " replay still recomputes the wo GMM; save it with moe_out=device. Requires sparse_matmul=True,"
+          " te_moe_block=False, use_ring_of_experts=True, use_ragged_sort=True, no tensor parallelism,"
+          " mlp_bias=False, no quantization, num_moe_emb_chunks=0, and a remat policy that does not save the wo GMM"
+          " output (moe_mlpwo / mlpwo; the minimal* and save_dot_except_mlpwi policies save mlpwo): the fused op"
+          " never forms it, so such a policy would silently stop saving it."
+      ),
+  )
   moe_quantize_combine_bwd_method: str | None = Field(
       "",
       description=(
@@ -1280,6 +1691,14 @@ class MoEGeneral(BaseModel):
       False,
       description="Enable top-k probability normalization for router weights (Qwen3-specific).",
   )
+  routed_weight_normalize: Optional[bool] = Field(
+      None,
+      description=(
+          "DeepSeek-style routing: whether the selected expert weights are renormalized to sum to 1 before "
+          "routed_scaling_factor is applied. None keeps the DeepSeek-V3 behavior (renormalize for sigmoid / "
+          "sqrtsoftplus scores)."
+      ),
+  )
   return_routed_experts: bool = Field(
       False,
       description=(
@@ -1295,6 +1714,16 @@ class MoEGeneral(BaseModel):
           " einsum and accumulates in float32 before casting back to the model dtype."
       ),
   )
+  router_matmul_precision: Literal["", "default", "high", "highest", "bfloat16", "float32"] = Field(
+      "",
+      description=(
+          "Matmul precision of the MoE gate (router) projection in GateLogit. Empty follows matmul_precision. On TPU"
+          " a float32 matmul at 'default' runs as one bfloat16 pass even with float32_gate_logits, so routing that"
+          " should be computed in float32 needs float32_gate_logits=True plus 'highest' here, without raising the"
+          " precision of every other matmul. Not read by the quantized gate, the TE MoE block or batch-split"
+          " scheduling; those combinations are rejected."
+      ),
+  )
   float32_gate_logits: bool = Field(
       False,
       description=(
@@ -1308,6 +1737,15 @@ class MoEGeneral(BaseModel):
           " does not control quantization -- see `quantize_router_proj`, which governs whether the gate"
           " projection matmul is quantized. Setting both is rejected at config init, because quantizing the"
           " projection discards the fp32 operand precision."
+      ),
+  )
+  routed_gate_bf16_rounding: bool = Field(
+      False,
+      description=(
+          "Round the MoE router (GateLogit) kernel to bfloat16 (round-to-nearest-even) and back before the"
+          " router matmul. With float32_gate_logits=True this makes the router matmul operands exactly the"
+          " bf16 weight x bf16 activation of a mixed-precision GPU router (FP32 accumulate and output), without"
+          " depending on how the backend rounds FP32 operands at matmul_precision."
       ),
   )
   prefuse_moe_weights: bool = Field(
@@ -1429,6 +1867,15 @@ class MoEKernels(BaseModel):
       False,
       description="Whether to use the heuristic tiling from Tokamax GMM v2, when use_gmm_v2=true.",
   )
+  gmm_v2_native_transpose_rhs: bool = Field(
+      False,
+      description=(
+          "With use_gmm_v2: the backward input gradient (dlhs = dout @ w^T) reads weight tiles transposed inside the "
+          "gmm_v2 kernel ([tile_n, tile_k] blocks, last-dim contraction) instead of first copying a transposed weight "
+          "in HBM. Requires use_gmm_v2 and use_tokamax_gmm. Applies where the kernel supports it (rhs unquantized, of "
+          "the gradient dtype, >= 8 bits); other cases, including pre-quantized (QArray) gradients, keep the copy path."
+      ),
+  )
 
 
 class DeepSeekMoE(BaseModel):
@@ -1440,6 +1887,20 @@ class DeepSeekMoE(BaseModel):
   routed_score_func: str = Field("", description="Scoring function for routing (e.g., 'softmax', 'sigmoid').")
   routed_bias: bool = Field(False, description="Whether to add a bias term for routing.")
   routed_bias_update_rate: float = Field(0.0, description="Update rate applied to the router bias term.")
+  mlp_activations_limit_inclusive_grad: bool = Field(
+      False,
+      description=(
+          "With mlp_activations_limit > 0 on DeepSeek blocks, pass the full gradient when an activation equals the "
+          "clip bound exactly (torch.clamp semantics) instead of jnp.clip's 0.5."
+      ),
+  )
+  routed_bias_zero_mean_update: bool = Field(
+      False,
+      description=(
+          "Subtract the mean over experts from each routed-bias update, so the update sums to zero per layer and the "
+          "bias does not drift as a whole (DeepSeek block and its MTP layers)."
+      ),
+  )
   defer_small_all_reduces: bool = Field(
       False,
       description="Ring-of-experts sparse_matmul only: drop the per-layer all-reduces of the routed-bias expert counts"
@@ -1857,6 +2318,39 @@ class RematAndOffload(BaseModel):
           "routing/metadata bundle. 'device' saves them across the remat boundary so the backward "
           "does not re-run the dispatch token all-gather and ragged sort; the expert GMMs re-run "
           "from the saved tensor. Default 'remat' recomputes (existing behavior)."
+      ),
+  )
+  moe_out: RematLocation = Field(
+      RematLocation.REMAT,
+      description=(
+          "Remat policy for the MoE block output (routed + shared experts after the expert-parallel combine, tagged "
+          "in RoutedAndSharedMoE). Only useful when an op after the MoE block needs that output in the backward, "
+          "e.g. the hyper-connection post gate; a plain residual add does not. 'device' saves it so the rematted "
+          "forward does not rebuild it (the routed experts' output projection and combine reduce-scatter); the "
+          "expert GMMs for the backward still re-run unless moe_x_sorted / moe_mlpwi_* are saved too. "
+          "Default 'remat' recomputes (existing behavior)."
+      ),
+  )
+  moe_expert_weights: RematLocation = Field(
+      RematLocation.REMAT,
+      description=(
+          "Remat policy for the routed experts' weights (w0 / w1 / wo and biases) after the FSDP all-gather, tagged at "
+          "the entry of the sparse_matmul shard_map (sparse_matmul=True only). 'device' keeps the gathered weights "
+          "across the remat boundary so the rematted forward does not all-gather them again. HBM cost: the gathered "
+          "weights every device holds for each MoE layer, i.e. its local experts under expert parallelism, all experts "
+          "when the expert axis is not sharded (e.g. shard_exp_on_fsdp without explicit weight gather, "
+          "use_2d_fsdp_sharding). 'offload' moves that much to the host and back every layer and step, which is usually "
+          "slower than the all-gather it replaces. Default 'remat' recomputes (existing behavior)."
+      ),
+  )
+  attention_gate: RematLocation = Field(
+      RematLocation.REMAT,
+      description=(
+          "Remat policy for the output-gate projection of gated attention (attention_output_gate='elementwise', MLA): "
+          "gate_proj(inputs_q), [batch, seq, heads, v_head_dim] per layer. 'device' keeps it across the remat "
+          "boundary so the rematted forward does not recompute the projection to rebuild the sigmoid gate (the backward "
+          "still uses the full weight for the input gradient). Only effective with remat_policy='custom'. Default "
+          "'remat' recomputes (existing behavior)."
       ),
   )
   moe_routing_maps: RematLocation = Field(
@@ -2336,6 +2830,17 @@ class TrainingLoop(BaseModel):
   enable_data_shuffling: bool = Field(True, description="Enables shuffling of the training data.")
   data_shuffle_seed: int = Field(0, description="Seed for data shuffling.")
   init_weights_seed: int = Field(0, description="Seed for model weight initialization.")
+  init_weights_std: float = Field(
+      0.0,
+      ge=0.0,
+      description=(
+          "If > 0, re-draw every weight matrix after model construction from N(0, init_weights_std^2), like HF"
+          " initializer_range: every 'kernel' (dense layers, the MoE router and attention gate projections included),"
+          " embeddings, MoE expert weights (wi / wi_0 / wi_1 / wo) and hyper-connection projections. Norm scales,"
+          " biases, sinks and gate scales keep their own init, and so does any matrix whose default init is all zeros."
+          " NNX model creation only; the key comes from init_weights_seed."
+      ),
+  )
   max_inflight_computations: int = Field(2, description="Maximum number of inflight computations on device.")
   block_state_before_run_start: bool = Field(
       False,
@@ -2403,11 +2908,100 @@ class ManifoldConstrainedHyperConnections(BaseModel):
       1024,
       description=("Feature block size for backward pass of MHC Pallas kernel."),
   )
+  hc_variant: Literal["mhc", "ihc"] = Field(
+      "mhc",
+      description=(
+          "Hyper-connection variant. 'mhc': manifold-constrained (sinkhorn / mHC-lite residual mixing). "
+          "'ihc': identity hyper-connections (Hy4) -- no residual mixing matrix, unweighted input norm, "
+          "post gate = hc_post_magnitude * sigmoid(.) + hc_eps, computed in float32."
+      ),
+  )
+  hc_post_magnitude: float = Field(2.0, description="Scale of the post-mapping sigmoid gate (iHC).")
+  hc_eps: float = Field(1e-6, description="Epsilon added to the iHC pre/post gates and to the HC head gate.")
+  hc_init_std: float = Field(
+      0.006,
+      description="Stddev of the normal init of the iHC pre/post projection weights (the HC head init is unchanged).",
+  )
+  hc_matmul_precision: Literal["", "default", "high", "highest"] = Field(
+      "",
+      description=(
+          "Matmul precision of the hyper-connection gate projections (iHC pre/post mixes and the HC head mixes). "
+          "Empty keeps the previous behaviour: iHC uses 'highest' and the HC head follows matmul_precision. "
+          "Set 'highest' to keep both in float32 on TPU, where 'default' runs a float32 matmul as one bfloat16 pass."
+      ),
+  )
+  ihc_stream_sum_unrolled: bool = Field(
+      False,
+      description=(
+          "iHC only: compute the weighted stream sum pre[k] * x[k] as k explicit float32 multiply-adds instead of the"
+          " HIGHEST-precision einsum over the k axis. Both are float32, but on TPU the HIGHEST einsum is a multi-pass"
+          " bfloat16 approximation and the multiply-adds are native float32, so results differ by more than summation order."
+      ),
+  )
+  ihc_force_bf16_rounding: bool = Field(
+      False,
+      description=(
+          "iHC (XLA path): round the branch input (weighted stream sum) and the updated streams to `dtype` with"
+          " reduce_precision before the cast. A plain float32 -> dtype -> float32 round trip may be removed by XLA"
+          " under excess precision when the consumer casts back to float32 (the branch norm, the next hyper-connection),"
+          " so the value would stay float32; eager frameworks (Megatron-Core) always round there."
+      ),
+  )
+  use_ihc_pallas_kernel: bool = Field(
+      False,
+      description=(
+          "iHC only: run the gates, the weighted stream sum and the residual update as fused Pallas TPU kernels"
+          " (kernels/ihc), with a hand-written backward. Everything stays float32; the gate projection uses exact"
+          " bfloat16 splits of its float32 operands, so it matches a float32 matmul up to summation order."
+          " Requires bfloat16 activations, mhc_expansion_rate <= 5 and an unsharded embedding axis; falls back to the"
+          " XLA path when the per-device token count does not tile into the block sizes (e.g. decode)."
+      ),
+  )
+  ihc_pallas_block_size: int = Field(128, description="Token rows per grid step of the iHC forward kernels.")
+  ihc_pallas_bwd_block_size: int = Field(64, description="Token rows per grid step of the iHC backward kernels.")
+  use_hc_head: bool = Field(
+      False,
+      description=(
+          "Collapse the hyper-connection streams with a learned HC head before the final norm "
+          "(always on for the DEEPSEEK4 decoder block)."
+      ),
+  )
+  hc_head_norm_epsilon: float = Field(
+      1e-6,
+      description=(
+          "Epsilon of the unweighted RMS norm inside the HC head (DeepSeek-V4 uses 1e-6). Not tied to "
+          "normalization_layer_epsilon: a model whose head norm uses rms_norm_eps (Hy4) sets it explicitly."
+      ),
+  )
+  hc_head_base_init: float = Field(0.0, description="Initial value of the HC head gate bias (Hy4: -log(k - 1)).")
 
   @model_validator(mode="after")
   def validate_mhc_kernel(self) -> "ManifoldConstrainedHyperConnections":
     if self.use_mhc_pallas_kernel and not self.enable_mhc_lite:
       raise ValueError("use_mhc_pallas_kernel=True requires enable_mhc_lite=True.")
+    if self.hc_variant == "ihc":
+      if self.mhc_expansion_rate <= 1:
+        raise ValueError("hc_variant='ihc' requires mhc_expansion_rate > 1.")
+      if self.enable_mhc_lite or self.use_mhc_pallas_kernel:
+        raise ValueError(
+            "hc_variant='ihc' has no mHC-lite / Pallas kernel path; unset enable_mhc_lite and use_mhc_pallas_kernel."
+        )
+    if self.ihc_stream_sum_unrolled and self.hc_variant != "ihc":
+      raise ValueError("ihc_stream_sum_unrolled=True only applies to hc_variant='ihc'.")
+    if self.use_ihc_pallas_kernel:
+      # Kernel prerequisites known at config time (kernels/ihc); the embedding-axis sharding is checked at trace time.
+      if self.hc_variant != "ihc":
+        raise ValueError("use_ihc_pallas_kernel=True only applies to hc_variant='ihc'.")
+      if self.mhc_expansion_rate > 5:
+        raise ValueError(f"use_ihc_pallas_kernel supports mhc_expansion_rate <= 5; got {self.mhc_expansion_rate}.")
+      if self.hc_matmul_precision not in ("", "highest"):
+        # The kernel's gate projection is float32-exact (bit-split bfloat16 pieces), i.e. 'highest'; a lower setting
+        # would be silently ignored.
+        raise ValueError(
+            f"use_ihc_pallas_kernel computes the gates at float32 precision; hc_matmul_precision must be '' or 'highest', got '{self.hc_matmul_precision}'."
+        )
+    if self.use_hc_head and self.mhc_expansion_rate <= 1:
+      raise ValueError("use_hc_head=True requires mhc_expansion_rate > 1.")
     return self
 
 
@@ -2590,6 +3184,65 @@ class Muon(BaseModel):
           "Whether to apply Muon updates to MoE router matrices. If False," " routers are optimized with AdamW."
       ),
   )
+  muon_exclude_ihc: bool = Field(
+      False,
+      description=(
+          "If True, hyper-connection matrices (pre / post / res alpha of each layer and the HC head's hc_fn) are"
+          " optimized with AdamW instead of Muon. Off: they go to Muon like other 2D weights."
+      ),
+  )
+  muon_mcore_nesterov: bool = Field(
+      False,
+      description=(
+          "optax_muon only. If True, Nesterov momentum without bias correction (Megatron-Core / emerging_optimizers):"
+          " update direction beta * mu_t + (1 - beta) * g_t. Off: optax's bias-corrected form."
+      ),
+  )
+  muon_adam_plain: bool = Field(
+      False,
+      description=(
+          "optax_muon only. If True, the AdamW branch of Muon (non-matrix parameters) is plain Adam, as Megatron-Core's"
+          " scalar optimizer. Off: it follows the Muon Nesterov flag (optax NAdam)."
+      ),
+  )
+  muon_mcore_ns_normalize: bool = Field(
+      False,
+      description=(
+          "optax_muon only. If True, Newton-Schulz input is x / max(||x||_F, 1e-7) (Megatron-Core)."
+          " Off: x / (||x||_F + adam_eps) (optax)."
+      ),
+  )
+  muon_mcore_ns_bf16: bool = Field(
+      False,
+      description=(
+          "optax_muon only. If True, the Newton-Schulz iterations run on BF16 tensors as Megatron-Core's"
+          " emerging_optimizers does at muon_fp32_matmul_prec='medium' (BF16 matmul operands, FP32 accumulation,"
+          " A / B / X rounded to BF16 every step). Off: the iterations stay in FP32."
+      ),
+  )
+  muon_adam_accurate: bool = Field(
+      False,
+      description=(
+          "optax_muon with muon_adam_plain only. If True, the AdamW branch computes its float32 divisions as a"
+          " reciprocal refined by one Newton step, and the square root and the bias corrections 1 - b^t through"
+          " lax accuracy=HIGHEST (TPU's default float32 division / sqrt / pow are approximate). Off: optax adamw."
+      ),
+  )
+  muon_attention_gate_whole_matrix: bool = Field(
+      False,
+      description=(
+          "If True, the MLA elementwise output gate gate_proj [emb, (layers), heads, v_head_dim] is orthogonalized as"
+          " one [emb, heads * v_head_dim] matrix. Off: one matrix per head (the heads axis is a batch axis)."
+      ),
+  )
+  muon_fuse_glu: bool = Field(
+      False,
+      description=(
+          "If True (optax_muon only), the gated-MLP wi_0 and wi_1 of each layer (dense, shared and routed experts) are"
+          " orthogonalized as one matrix, concatenated on the output axis, like Megatron-Core's fused linear_fc1."
+          " Off: wi_0 and wi_1 are orthogonalized separately."
+      ),
+  )
   muon_use_all_to_all: bool = Field(
       False,
       description=(
@@ -2639,6 +3292,12 @@ class YarnRope(BaseModel):
   beta_slow: int = Field(1, description="The 'beta_slow' parameter for YaRN.")
   mscale: float = Field(1.0, description="The 'mscale' parameter for YaRN.")
   rope_interleave: bool = Field(True, description="Whether RoPE sin/cos are interleaved vs concatenated.")
+  checkpoint_rope_interleave: bool = Field(
+      False,
+      description="The HF checkpoint stores q_pe / k_pe in interleaved pairs (2i, 2i+1); the Hy4 HF -> MaxText"
+      " conversion de-interleaves those weight columns so the model runs concatenated RoPE. Hy4 only; needs"
+      " rope_interleave=False and indexer_rope_interleave=False.",
+  )
   rope_truncate: bool = Field(True, description="Whether to floor/ceil the correction range for YaRN.")
   rope_attention_scaling: bool = Field(
       False,
@@ -3533,8 +4192,13 @@ FORCED_ROUTING_SUPPORTED_DECODER_BLOCKS = (
 )
 
 
-def check_forced_routing_support(decoder_block: DecoderBlockType) -> None:
-  """Raises NotImplementedError if `decoder_block` does not support router replay."""
+def check_forced_routing_support(decoder_block: DecoderBlockType, allow_deepseek: bool = False) -> None:
+  """Raises NotImplementedError if `decoder_block` does not support router replay.
+
+  allow_deepseek (config debug_forced_routing_deepseek) also admits DecoderBlockType.DEEPSEEK.
+  """
+  if allow_deepseek and decoder_block == DecoderBlockType.DEEPSEEK:
+    return
   if decoder_block not in FORCED_ROUTING_SUPPORTED_DECODER_BLOCKS:
     raise NotImplementedError(
         "Forced routing (router replay) is only supported for decoder_block in"
@@ -3831,12 +4495,65 @@ class MaxTextConfig(
             f"{prefix} is not supported with optimizer_memory_host_offload or parameter_memory_host_offload."
         )
 
+  def validate_moe_router_grad_from_wo_input(self):
+    """The fused wo GMM + unsort needs the ring-of-experts ragged sort and a wo GMM that is the bare GEMM of its rows."""
+    if not self.moe_router_grad_from_wo_input:
+      return
+    # Named policies whose save list contains "mlpwo", the name the unfused wo GMM output carries.
+    policies_saving_mlpwo = {
+        "minimal",
+        "minimal_with_context",
+        "minimal_flash",
+        "minimal_with_quantization",
+        "minimal_with_context_and_quantization",
+        "save_dot_except_mlpwi",
+        "minimal_offloaded",
+    }
+    custom_saves = [
+        name
+        for name in ("moe_mlpwo", "mlpwo")
+        if self.remat_policy == "custom" and getattr(self, name) != RematLocation.REMAT
+    ]
+    requirements = [
+        (self.sparse_matmul, "sparse_matmul=True"),
+        (not self.te_moe_block, "te_moe_block=False"),
+        (self.use_ring_of_experts, "use_ring_of_experts=True"),
+        (self.use_ragged_sort, "use_ragged_sort=True"),
+        (
+            self.ici_tensor_parallelism * self.dcn_tensor_parallelism == 1,
+            "no tensor parallelism in the MoE layer (ici/dcn_tensor_parallelism=1)",
+        ),
+        (not self.mlp_bias, "mlp_bias=False"),
+        (self.quantization in (None, QuantizationType.NONE, ""), "no quantization"),
+        (self.num_moe_emb_chunks <= 0, "num_moe_emb_chunks=0"),
+        # The batch-split schedule has its own MoE path that never reads this key.
+        (not self.use_batch_split_schedule, "use_batch_split_schedule=False"),
+        (
+            self.remat_policy not in policies_saving_mlpwo,
+            f"a remat policy that does not save the wo GMM output (remat_policy={self.remat_policy} saves it as mlpwo)",
+        ),
+        (
+            not custom_saves,
+            f"moe_mlpwo=remat and mlpwo=remat (remat_policy=custom saves it as {', '.join(custom_saves)})",
+        ),
+    ]
+    unmet = [text for ok, text in requirements if not ok]
+    if unmet:
+      raise ValueError(f"moe_router_grad_from_wo_input=True requires: {'; '.join(unmet)}.")
+
   def validate_retry_dropless_first_steps_and_first_phase_buffer(self):
     """Validates retry_dropless_first_steps, first_phase_ragged_buffer_factor and the REQUIRED_RBF probe."""
     if self.retry_dropless_first_steps < 0:
       raise ValueError(f"retry_dropless_first_steps must be >= 0 (got {self.retry_dropless_first_steps}).")
     if self.retry_dropless_first_steps > 0 and self.moe_dropless_fallback != "step":
       raise ValueError("retry_dropless_first_steps > 0 requires moe_dropless_fallback='step'.")
+    if not self.moe_dropless_retry:
+      if self.moe_dropless_fallback != "step":
+        raise ValueError("moe_dropless_retry=False requires moe_dropless_fallback='step'.")
+      if self.retry_dropless_first_steps > 0:
+        raise ValueError(
+            "retry_dropless_first_steps > 0 needs the dropless program; it requires moe_dropless_retry=True."
+        )
     if self.first_phase_ragged_buffer_factor < 0:
       raise ValueError(
           f"first_phase_ragged_buffer_factor must be 0 (off) or > 0 (got {self.first_phase_ragged_buffer_factor})."
@@ -3874,6 +4591,45 @@ class MaxTextConfig(
           "moe_log_max_load_ratio=True requires sparse_matmul=True, te_moe_block=False,"
           " use_ring_of_experts=True and use_ragged_sort=True."
       )
+
+  def validate_indexer_kth_select(self):
+    """indexer_kth_select is exact; it cannot be combined with the approximate top-k path."""
+    if self.indexer_kth_select and self.indexer_use_approx_top_k:
+      raise ValueError("indexer_kth_select=True cannot be combined with indexer_use_approx_top_k=True.")
+
+  def validate_splash_static_causal_partial_mask(self):
+    """splash_static_causal_partial_mask replaces the indexer's make_dynamic_splash_mha call in tpu_flash_attention.
+
+    Training reaches tpu_flash_attention with attention 'flash' or 'autoselected'. The attention_type check also
+    covers IndexCache: every DeepSeek MLA layer, including the one whose indexer mask others reuse, has this type.
+    Conditions only known at trace time make the attention op keep the dynamic path instead.
+    """
+    if not self.splash_static_causal_partial_mask:
+      return
+    problems = []
+    if not self.use_indexer:
+      problems.append("use_indexer=True (without an indexer mask the flag does nothing)")
+    if self.attention not in ("flash", "autoselected") or not self.use_tokamax_splash:
+      problems.append("attention='flash' or 'autoselected' with use_tokamax_splash=True")
+    plain_causal = tuple(t.value for t in PLAIN_CAUSAL_ATTENTION_TYPES)
+    if self.attention_type not in plain_causal:
+      problems.append(f"attention_type in {plain_causal} (got {self.attention_type!r})")
+    if self.use_multimodal:
+      problems.append("use_multimodal=False (bidirectional image masks admit kv > q)")
+    for name in ("sa_block_q", "sa_block_kv", "sa_block_q_dkv", "sa_block_kv_dkv"):
+      block = min(getattr(self, name), self.max_target_length)
+      if self.max_target_length % block:
+        problems.append(f"{name}={block} dividing max_target_length={self.max_target_length}")
+    try:
+      # pylint: disable-next=import-outside-toplevel
+      from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask_info
+    except ImportError:
+      splash_attention_mask_info = None
+    missing = [name for name in SPLASH_STATIC_CAUSAL_TOKAMAX_HELPERS if not hasattr(splash_attention_mask_info, name)]
+    if missing:
+      problems.append(f"tokamax splash_attention_mask_info.{', '.join(missing)} (verified with tokamax 0.0.16)")
+    if problems:
+      raise ValueError("splash_static_causal_partial_mask=True requires " + "; ".join(problems) + ".")
 
   def validate_moe_topk_before_ep_all_gather(self):
     """Validates that moe_topk_before_ep_all_gather is used with ring of experts."""
@@ -4049,6 +4805,42 @@ class MaxTextConfig(
             "use moe_x_sorted=remat."
         )
 
+  def validate_moe_expert_weights(self):
+    """moe_expert_weights is tagged only in the sparse_matmul shard_map; reject a non-remat value elsewhere."""
+    if self.moe_expert_weights != RematLocation.REMAT and (self.num_experts <= 1 or not self.sparse_matmul):
+      raise ValueError(
+          f"moe_expert_weights={RematLocation(self.moe_expert_weights).value} needs the sparse_matmul MoE path "
+          f"(num_experts > 1, sparse_matmul=True); got num_experts={self.num_experts}, "
+          f"sparse_matmul={self.sparse_matmul}. Use moe_expert_weights=remat."
+      )
+
+  def validate_attention_gate(self):
+    """attention_gate is tagged only where gated attention builds its gate; reject a non-remat value elsewhere."""
+    if self.attention_gate != RematLocation.REMAT and self.attention_output_gate != "elementwise":
+      raise ValueError(
+          f"attention_gate={RematLocation(self.attention_gate).value} needs gated attention "
+          f"(attention_output_gate='elementwise'); got attention_output_gate={self.attention_output_gate!r}. "
+          "Use attention_gate=remat."
+      )
+
+  def validate_moe_out(self):
+    """moe_out is tagged only in RoutedAndSharedMoE; reject a non-remat moe_out where nothing carries the name."""
+    if self.moe_out == RematLocation.REMAT:
+      return
+    tagged_blocks = (
+        DecoderBlockType.DEEPSEEK,
+        DecoderBlockType.DEEPSEEK4,
+        DecoderBlockType.LLAMA4,
+        DecoderBlockType.GEMMA4,
+    )
+    if self.num_experts <= 1 or self.decoder_block not in tagged_blocks or self.use_batch_split_schedule:
+      raise ValueError(
+          f"moe_out={RematLocation(self.moe_out).value} needs a RoutedAndSharedMoE block (decoder_block in "
+          f"{[b.value for b in tagged_blocks]}, num_experts > 1, use_batch_split_schedule=False); got "
+          f"decoder_block={self.decoder_block}, num_experts={self.num_experts}, "
+          f"use_batch_split_schedule={self.use_batch_split_schedule}. Use moe_out=remat."
+      )
+
   def validate_moe_quantize_token_all_gather(self):
     """Validates that moe_quantize_token_all_gather is used with supported settings."""
     if self.moe_quantize_token_all_gather:
@@ -4107,6 +4899,20 @@ class MaxTextConfig(
       return yaml.safe_load(f) or {}
 
   @model_validator(mode="after")
+  def validate_checkpoint_rope_interleave(self) -> "MaxTextConfig":
+    """checkpoint_rope_interleave is read only by the Hy4 converter and replaces both interleaved RoPE paths."""
+    if self.checkpoint_rope_interleave:
+      name = str(getattr(self.model_name, "value", self.model_name))
+      if not name.startswith("hy4"):
+        raise ValueError(f"checkpoint_rope_interleave is only implemented by the Hy4 converter, not {name}.")
+      if self.rope_interleave or self.indexer_rope_interleave:
+        raise ValueError(
+            "checkpoint_rope_interleave=True de-interleaves q_pe / k_pe at conversion; it needs rope_interleave=False"
+            " and indexer_rope_interleave=False (otherwise the columns are permuted twice)."
+        )
+    return self
+
+  @model_validator(mode="after")
   def validate_shard_embed_moe_on_fsdp(self) -> "MaxTextConfig":
     """Raise ValueError if shard_embed_moe_on_fsdp is used without fixed weight quantization calibration."""
     if self.shard_embed_moe_on_fsdp and (
@@ -4157,6 +4963,17 @@ class MaxTextConfig(
           current = getattr(self, flag_name)
           if current != disabled_value:
             raise ValueError(f"When EP rank is 1, {flag_name} must be {disabled_value} (was {current}).")
+
+    # embedding_shard_over_data: the token-embedding table's hidden dimension gets its own logical axis, mapped to
+    # 'data' followed by the axes of 'embed_vocab' (which the output head kernel and other tables keep using).
+    if self.embedding_shard_over_data:
+      if self.shard_optimizer_over_data:
+        raise ValueError("embedding_shard_over_data cannot be combined with shard_optimizer_over_data.")
+      embed_vocab_axes = axes_for_logical(self.logical_axis_rules, "embed_vocab")
+      if not any(rule and rule[0] == "embed_vocab_table" for rule in self.logical_axis_rules):
+        self.logical_axis_rules.append(
+            ["embed_vocab_table", ["data", *(a for a in embed_vocab_axes if a != "data")]]
+        )
 
     # Handle eval custom mesh and rule
     if self.custom_mesh_and_rule_for_eval is CustomRule.DEFAULT:
@@ -4523,6 +5340,9 @@ class MaxTextConfig(
           "mlpwi",
           "moe_mlpwi_0",
           "moe_x_sorted",
+          "moe_out",
+          "moe_expert_weights",
+          "attention_gate",
           "moe_routing_maps",
           "moe_mlpwi_1",
           "moe_mlpwo",
@@ -4819,6 +5639,21 @@ class MaxTextConfig(
             f"Sparse indexer with {self.attention_type} is only supported with dot_product attention or flash "
             "attention with tokamax splash."
         )
+      if self.indexer_share_interval > 1 and not (
+          self.decoder_block == DecoderBlockType.DEEPSEEK
+          and self.attention_type == AttentionType.MLA.value
+          and self.scan_layers
+          and not self.engram_layers
+          and not self.use_batch_split_schedule
+          and not self.using_pipeline_parallelism
+          and not self.use_lineage
+          and not self.use_qwix_quantization
+          and not self.lora.lora_weight_qtype
+      ):
+        raise NotImplementedError(
+            "`indexer_share_interval > 1` (IndexCache) is implemented only for scanned DeepSeek MLA decoders without"
+            " Engram, batch-split scheduling, pipeline parallelism, lineage, qwix quantization or LoRA quantization."
+        )
       if self.attention_type == AttentionType.MLA.value:
         if (
             self.attention == "flash"
@@ -4962,6 +5797,14 @@ class MaxTextConfig(
             " remains quantized while believing you configured fp32. Set `quantize_logits_proj=False` to keep"
             " the projection in fp32."
         )
+    if self.router_matmul_precision:
+      if not self.float32_gate_logits:
+        raise ValueError("router_matmul_precision only matters with float32_gate_logits=True (bf16 operands).")
+      if self.te_moe_block or self.use_batch_split_schedule or (self.quantization and self.quantize_router_proj):
+        raise ValueError(
+            "router_matmul_precision is not read by te_moe_block, use_batch_split_schedule or a quantized router"
+            " projection (quantize_router_proj with quantization)."
+        )
     if self.quantization and self.use_qwix_quantization and self.quantize_router_proj and self.float32_gate_logits:
       raise ValueError(
           "`float32_gate_logits=True` is rejected with `quantize_router_proj=True`: the fp32 cast on"
@@ -5037,8 +5880,14 @@ class MaxTextConfig(
       self.validate_moe_dropless_fallback()
       self.validate_moe_log_max_load_ratio()
     self.validate_num_moe_emb_chunks()
+    self.validate_moe_out()
+    self.validate_moe_router_grad_from_wo_input()
+    self.validate_moe_expert_weights()
+    self.validate_attention_gate()
     self.validate_moe_quantize_token_all_gather()
     self.validate_moe_topk_before_ep_all_gather()
+    self.validate_indexer_kth_select()
+    self.validate_splash_static_causal_partial_mask()
     self.validate_moe_quantize_combine_bwd_method()
     self.validate_mllog()
     self.validate_retry_dropless_first_steps_and_first_phase_buffer()
@@ -5454,6 +6303,22 @@ class MaxTextConfig(
     if self.use_batch_split_schedule:
       if self.quantization and not self.quantization == "fp8_full":
         raise ValueError("Batch split quantization only supports `quantization=fp8_full`")
+      if self.attention_output_gate is not None or self.mla_lora_norm_epsilon >= 0 or self.attention_sink:
+        # deepseek_batchsplit has its own MLA that would silently drop these.
+        raise ValueError(
+            "use_batch_split_schedule does not support attention_output_gate, mla_lora_norm_epsilon or attention_sink."
+        )
+    if self.attention_output_gate is not None and self.attention_type != "mla":
+      raise ValueError("attention_output_gate is only implemented for attention_type='mla'.")
+    if self.mla_lora_norm_epsilon == 0:
+      raise ValueError("mla_lora_norm_epsilon must be > 0, or negative to use normalization_layer_epsilon.")
+    if self.mtp_input_post_final_norm and self.mtp_num_layers == 0:
+      # A warning, not an error: turning MTP off with mtp_num_layers=0 on a model config that sets this is normal.
+      logger.warning("mtp_input_post_final_norm=True has no effect without mtp_num_layers > 0.")
+    if self.routed_bias_zero_mean_update and not self.routed_bias:
+      raise ValueError("routed_bias_zero_mean_update=True requires routed_bias=True.")
+    if self.mlp_activations_limit_inclusive_grad and not self.mlp_activations_limit > 0.0:
+      raise ValueError("mlp_activations_limit_inclusive_grad=True requires mlp_activations_limit > 0.")
 
     if self.opt_type == "muon" and self.decoder_block not in [
         DecoderBlockType.DEEPSEEK,
@@ -5524,6 +6389,8 @@ class MaxTextConfig(
 
     if self.use_gmm_v2_heuristic_tiling and not self.use_gmm_v2:
       raise ValueError("`use_gmm_v2_heuristic_tiling=True` requires `use_gmm_v2=True`.")
+    if self.gmm_v2_native_transpose_rhs and not (self.use_gmm_v2 and self.use_tokamax_gmm):
+      raise ValueError("`gmm_v2_native_transpose_rhs=True` requires `use_gmm_v2=True` and `use_tokamax_gmm=True`.")
 
     for val in self.compress_ratios:
       if val != 0 and val < 4:
@@ -5894,10 +6761,8 @@ class RLConfig(
         self.tokenizer_path = HF_IDS[model_name]
         self.tokenizer_type = TokenizerType.HUGGINGFACE
       else:
-        raise ValueError(
-            "model_name not found in HF_IDS in maxtext/src/maxtext/utils/globals.py. \
-          Please pass tokenizer_path in your command."
-        )
+        raise ValueError("model_name not found in HF_IDS in maxtext/src/maxtext/utils/globals.py. \
+          Please pass tokenizer_path in your command.")
 
     if self.optimizer_memory_host_offload:
       raise ValueError(
@@ -5979,6 +6844,9 @@ class RLConfig(
           "mlpwi",
           "moe_mlpwi_0",
           "moe_x_sorted",
+          "moe_out",
+          "moe_expert_weights",
+          "attention_gate",
           "moe_routing_maps",
           "moe_mlpwi_1",
           "moe_mlpwo",

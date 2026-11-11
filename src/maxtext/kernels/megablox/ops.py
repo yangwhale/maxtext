@@ -76,8 +76,13 @@ def gmm(
     use_gmm_v2: bool = False,
     use_gmm_v2_heuristic_tiling: bool = False,
     partial_sum: jnp.ndarray | None = None,
+    gmm_v2_native_transpose_rhs: bool = False,
 ):
-  """Grouped matrix multiplication operation."""
+  """Grouped matrix multiplication operation.
+
+  gmm_v2_native_transpose_rhs: with use_gmm_v2, the backward dlhs = dout @ rhs^T reads rhs tiles transposed inside
+  the gmm_v2 kernel instead of first copying a transposed rhs in HBM (unquantized dout only).
+  """
   if interpret is None:
     # Default to native (TPU) lowering. `jax.devices()[0]` is NOT the compile TARGET:
     # during train_compile the local backend is CPU (JAX_PLATFORMS=cpu) while the mesh
@@ -110,7 +115,7 @@ def gmm(
   gmm_fwd_bwd = lambda *args: _gmm_fwd(*args)[0]  # pylint: disable=C3001
   gmm_fwd_bwd = jax.custom_vjp(
       gmm_fwd_bwd,
-      nondiff_argnums=(3, 4, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16),
+      nondiff_argnums=(3, 4, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18),
   )
   gmm_fwd_bwd.defvjp(_gmm_fwd, functools.partial(_gmm_bwd, lhs.dtype, rhs.dtype))
   return gmm_fwd_bwd(
@@ -132,6 +137,7 @@ def gmm(
       use_gmm_v2,
       use_gmm_v2_heuristic_tiling,
       partial_sum,
+      gmm_v2_native_transpose_rhs,
   )
 
 
@@ -169,6 +175,7 @@ def _gmm_fwd(
     use_gmm_v2: bool = False,
     use_gmm_v2_heuristic_tiling: bool = False,
     partial_sum: jnp.ndarray | None = None,
+    gmm_v2_native_transpose_rhs: bool = False,  # pylint: disable=unused-argument
 ) -> tuple[
     jnp.ndarray,
     tuple[
@@ -497,6 +504,7 @@ def _gmm_bwd(
     rhs_vma_axes: tuple,
     use_gmm_v2: bool,
     use_gmm_v2_heuristic_tiling: bool,
+    gmm_v2_native_transpose_rhs: bool,
     residual: tuple[
         jnp.ndarray | qpl.QArray,
         jnp.ndarray | qpl.QArray,
@@ -566,6 +574,7 @@ def _gmm_bwd(
       interpret,
       lhs_vma_axes,
       use_gmm_v2_heuristic_tiling,
+      gmm_v2_native_transpose_rhs,
   )
 
   # 4. DRHS Gradient Execution
@@ -716,6 +725,7 @@ def _compute_dlhs(
     interpret: bool,
     lhs_vma_axes: tuple,
     use_gmm_v2_heuristic_tiling: bool,
+    gmm_v2_native_transpose_rhs: bool = False,
 ) -> jnp.ndarray:
   """Routes execution of DLHS based on backend choices."""
   if use_tokamax_backend and not use_gmm_v2:
@@ -729,7 +739,15 @@ def _compute_dlhs(
     )
   elif use_tokamax_backend and use_gmm_v2:
     return _dlhs_run_tokamax_v2(
-        dlhs_dout, rhs, group_sizes, group_offset, lhs_dtype, tiling, use_gmm_v2_heuristic_tiling, transpose_rhs
+        dlhs_dout,
+        rhs,
+        group_sizes,
+        group_offset,
+        lhs_dtype,
+        tiling,
+        use_gmm_v2_heuristic_tiling,
+        transpose_rhs,
+        gmm_v2_native_transpose_rhs,
     )
   else:
     return _dlhs_run_megablox(
@@ -805,10 +823,19 @@ def _dlhs_run_tokamax_v2(
     tiling: tuple,
     use_gmm_v2_heuristic_tiling: bool,
     transpose_rhs: bool,
+    native_transpose_rhs: bool = False,
 ) -> jnp.ndarray:
   """Executes Tokamax GMM V2 backend for DLHS = DLHS_dout @ RHS^T."""
-  # NOTE: We manually transpose RHS here because gmm_v2 lacks native transpose_rhs support.
-  dlhs_rhs = rhs if transpose_rhs else rhs.swapaxes(1, 2)
+  # rhs is [g, k, n] when transpose_rhs=False. dlhs needs rhs^T [g, n, k]: either copy it (default) or, with
+  # native_transpose_rhs, hand the original [g, k, n] to the kernel as an rhs_transposed operand ([g, N', K']).
+  # Native only where the kernel supports it (unquantized rhs of the dout dtype); otherwise copy as before.
+  native = (
+      native_transpose_rhs
+      and not transpose_rhs
+      and not isinstance(dlhs_dout, qpl.QArray)
+      and gmm_v2.supports_rhs_transposed(dlhs_dout.dtype, rhs.dtype)
+  )
+  dlhs_rhs = rhs if (transpose_rhs or native) else rhs.swapaxes(1, 2)
   dlhs_lhs = dlhs_dout.qvalue if isinstance(dlhs_dout, qpl.QArray) else dlhs_dout
 
   if use_gmm_v2_heuristic_tiling:
@@ -827,6 +854,7 @@ def _dlhs_run_tokamax_v2(
       group_offset=group_offset,
       # Bypass internal quantization if incoming dlhs_dout is already a QArray.
       maybe_quantize_lhs=not isinstance(dlhs_dout, qpl.QArray),
+      rhs_transposed=native,
   )
 
   # Rescale dlhs by dlhs_dout.scale when incoming gradient was pre-quantized QArray.

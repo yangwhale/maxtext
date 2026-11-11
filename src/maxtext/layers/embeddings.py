@@ -21,7 +21,7 @@ from typing import Any
 import jax
 from jax import lax
 import jax.numpy as jnp
-from jax.sharding import Mesh, NamedSharding
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from flax import nnx
 
@@ -40,6 +40,55 @@ def _maybe_move_embedding_to_device(embedding_table: Array, config: Config) -> A
     max_logging.log("embeddings.py: Moving embedding parameter to device")
     return jax.device_put(embedding_table, max_utils.device_space())
   return embedding_table
+
+
+
+def _spec_axes(entry) -> tuple:
+  """Mesh axis names of one PartitionSpec entry (None, a name, or a tuple of names)."""
+  if entry is None:
+    return ()
+  return tuple(entry) if isinstance(entry, (tuple, list)) else (entry,)
+
+
+def _embed_local_fp32_bf16_comm(table: Array, inputs: Array, dtype: DType, mesh: Mesh, out_pspec, out_sharding) -> Array:
+  """Gathers `table` rows by `inputs` and casts them to `dtype`; custom backward for embedding_grad_fp32_local_bf16_comm.
+
+  Forward: bitwise the same as gathering from the table cast to `dtype`. Backward: each device scatter-adds its own
+  tokens' cotangents in float32, rounds the local sum to bfloat16 once, and the data-parallel sum over the mesh axes that
+  shard the token dimensions is a bfloat16 psum, so the cross-device traffic stays bfloat16 (the same bytes as the
+  default path) while the local accumulation over repeated token ids no longer rounds at every update. The local sum
+  goes through an optimization barrier before the psum so XLA cannot fold the bfloat16 rounding into the all-reduce
+  (which would turn it into a float32 reduction with a bfloat16 output).
+  """
+  token_spec = tuple(out_pspec)[:-1]
+  embed_spec = tuple(out_pspec)[-1]
+  reduce_axes = tuple(a for e in token_spec for a in _spec_axes(e))
+  vocab = table.shape[0]
+
+  @jax.custom_vjp
+  def gather(tbl, ids):
+    return jnp.asarray(tbl.at[ids].get(out_sharding=out_sharding), dtype)
+
+  def gather_fwd(tbl, ids):
+    return gather(tbl, ids), ids
+
+  def gather_bwd(ids, g):
+    def local(ids_l, g_l):
+      acc = jnp.zeros((vocab, g_l.shape[-1]), jnp.float32).at[ids_l].add(g_l.astype(jnp.float32))
+      acc = lax.optimization_barrier(acc.astype(jnp.bfloat16))
+      return lax.psum(acc, reduce_axes) if reduce_axes else acc
+
+    grad = jax.shard_map(
+        local,
+        mesh=mesh,
+        in_specs=(PartitionSpec(*token_spec), PartitionSpec(*token_spec, embed_spec)),
+        out_specs=PartitionSpec(None, embed_spec),
+        check_vma=False,
+    )(ids, g)
+    return grad.astype(table.dtype), None
+
+  gather.defvjp(gather_fwd, gather_bwd)
+  return gather(table, inputs)
 
 
 class Embed(nnx.Module):
@@ -86,7 +135,9 @@ class Embed(nnx.Module):
             (self.num_embeddings, self.num_features),
             embed_weight_dtype,
         ),
-        sharding=("vocab", "embed_vocab"),
+        # embedding_shard_over_data: the hidden dimension of this table alone is also sharded over 'data'
+        # (embed_vocab_table = 'data' + the embed_vocab axes; the rule is added by the config).
+        sharding=("vocab", "embed_vocab_table" if getattr(config, "embedding_shard_over_data", False) else "embed_vocab"),
     )
 
   def __call__(self, inputs: Array, model_mode: str = MODEL_MODE_TRAIN) -> Array:
@@ -105,10 +156,12 @@ class Embed(nnx.Module):
     if not jnp.issubdtype(inputs.dtype, jnp.integer):
       raise ValueError("Input type must be an integer or unsigned integer.")
 
-    embedding = jnp.asarray(
-        _maybe_move_embedding_to_device(self.embedding.get_value(), self.config),
-        self.dtype,
-    )
+    local_bf16_comm = getattr(cfg, "embedding_grad_fp32_local_bf16_comm", False) and not cfg.use_iota_embed
+    grad_fp32 = getattr(cfg, "embedding_grad_fp32", False) and not cfg.use_iota_embed and not local_bf16_comm
+    table = _maybe_move_embedding_to_device(self.embedding.get_value(), self.config)
+    # embedding_grad_fp32: gather from the float32 table and cast the rows (bitwise the same as casting the table
+    # first), so the backward scatter-add accumulates in float32 instead of `dtype`.
+    embedding = table if grad_fp32 else jnp.asarray(table, self.dtype)
 
     output_axis_names = (
         (
@@ -129,12 +182,18 @@ class Embed(nnx.Module):
     if out_sharding is not None:
       out_sharding = truncate_out_sharding(out_sharding, inputs.ndim + 1)
 
+    if local_bf16_comm:
+      # embedding_grad_fp32_local_bf16_comm: float32 local scatter-add, bfloat16 data-parallel all-reduce
+      return _embed_local_fp32_bf16_comm(table, inputs, self.dtype, self.mesh, out_pspec, out_sharding)
+
     if cfg.use_iota_embed:
       iota = lax.iota(jnp.int32, self.num_embeddings)
       one_hot = jnp.array(inputs[..., jnp.newaxis] == iota, dtype=self.dtype)
       output = jnp.dot(one_hot, embedding, out_sharding=out_sharding)
     else:
       output = embedding.at[inputs].get(out_sharding=out_sharding)
+      if grad_fp32:
+        output = jnp.asarray(output, self.dtype)
 
     return output
 
@@ -196,9 +255,11 @@ def attend_on_embedding(
   if out_sharding is not None:
     out_sharding = truncate_out_sharding(out_sharding, query.ndim)
   embedding_table = _maybe_move_embedding_to_device(embedding_table, config)
+  logits_precision = getattr(config, "logits_matmul_precision", "")
   return jnp.dot(
       query,
       jnp.asarray(embedding_table, jnp.bfloat16).T,
+      precision=lax.Precision(logits_precision) if logits_precision else None,
       preferred_element_type=attend_dtype,
       out_sharding=out_sharding,
   )

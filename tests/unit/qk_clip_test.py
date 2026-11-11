@@ -127,6 +127,22 @@ class QKClipTest(unittest.TestCase):
     # Assert exact equality
     self.assertTrue(jnp.array_equal(new_wq, wq_b))
 
+  def test_negative_max_logit_is_not_clipped(self):
+    """A head whose largest attended logit is negative (it puts all its weight on the sink; real hy4 weights have one,
+    max logit -0.496 in layer 1) is below tau and keeps scale 1. min(1, tau / s_max) alone gives a negative scale and
+    sqrt of it NaN-filled wq_b / wkv_b (qk_clip_max_logit_exclude_sink, where the sink no longer lifts the max)."""
+    wq_b = jax.random.normal(jax.random.PRNGKey(3), (2, 2, 6))
+    wkv_b = jax.random.normal(jax.random.PRNGKey(4), (2, 2, 6))
+    params = {"decoder": {"layers_0": {"self_attention": {"wq_b": {"kernel": wq_b}, "wkv_b": {"kernel": wkv_b}}}}}
+    config, state = self._get_config_and_state(threshold=100.0, nope_dim=4, params_dict=params)
+    for max_logits in (jnp.array([[-0.4956, 14.45]]), jnp.array([[-jnp.inf, 14.45]]), jnp.array([[-0.4956, 150.0]])):
+      new = apply_qk_clip(state, {"decoder": {"layers_0": {"self_attention": {"max_logits": (max_logits,)}}}}, config)
+      sa = new.params["decoder"]["layers_0"]["self_attention"]
+      for name, w in (("wq_b", wq_b), ("wkv_b", wkv_b)):
+        got = sa[name]["kernel"]
+        self.assertTrue(bool(jnp.all(jnp.isfinite(got))), (name, max_logits))
+        np.testing.assert_array_equal(got[:, 0], w[:, 0])  # head 0: negative / -inf max logit, untouched
+
   def test_shared_keys_are_untouched(self):
     """Verifies that wkv_a (Shared Key) is ignored by the clipper."""
     rng = jax.random.PRNGKey(3)

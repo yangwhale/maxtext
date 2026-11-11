@@ -82,15 +82,51 @@ def _max_logits_at(curr):
   return ml
 
 
-def _scale_from_max_logits(max_logits_batch, tau):
+def _clip_scale(s_max, tau, denominator_eps):
+  """min(1, tau / (s_max + eps)); eps 1e-6 by default, 0 with qk_clip_mcore_denominator (Megatron-Core).
+
+  A head whose max logit is not positive is below tau (> 0) and keeps scale 1: tau / s_max would be negative (or -0
+  for -inf) and its square root in _clip_mla_weight NaN. Real weights have such heads, all their weight on the sink
+  (visible with qk_clip_max_logit_exclude_sink). Megatron-Core only clips when some head exceeds tau and would hit the
+  same NaN then; for every positive s_max the scale is unchanged."""
+  return jnp.where(s_max > 0, jnp.minimum(1.0, tau / (s_max + denominator_eps)), 1.0)
+
+
+def _scale_from_max_logits(max_logits_batch, tau, denominator_eps=1e-6):
+  """One scale per head from an unscanned layer's max_logits [..., num_heads]."""
   axes = tuple(range(max_logits_batch.ndim - 1))
   s_max = jnp.max(max_logits_batch, axis=axes)
-  return jnp.minimum(1.0, tau / (s_max + 1e-6))
+  return _clip_scale(s_max, tau, denominator_eps)
 
 
-def _clip_mla_weight(layer_name, param, scale, qk_nope):
-  """Apply the per-head scale to a wq_b or wkv_b kernel."""
-  scale_b = jnp.expand_dims(scale, axis=-1)  # broadcasts over [..., rank, heads, dim]
+def _kernel_scale(max_logits_batch, param, tau, param_scan_axis, denominator_eps=1e-6):
+  """QK-Clip scale for one wq_b / wkv_b kernel, shaped to broadcast against it: one value per layer and head.
+
+  Unscanned kernel [rank, heads, dim], max_logits [batch, heads]: one scale per head -> [heads, 1].
+  Scanned kernel with the layer axis at `param_scan_axis` ([rank, layers, heads, dim] by default); the scan stacks
+  its max_logits on axis 0 ([layers, batch, heads]). The max is taken per layer, so each layer is clipped by its own
+  max logit, as QK-Clip is defined; reducing over the layer axis as well would clip every layer of the scan by the
+  largest logit among them.
+  """
+  if param.ndim == 4:
+    num_layers, num_heads = param.shape[param_scan_axis], param.shape[-2]
+    if not 0 <= param_scan_axis < param.ndim - 2:
+      raise ValueError(f"QK-Clip: param_scan_axis={param_scan_axis} must come before the head axis of {param.shape}.")
+    if max_logits_batch.ndim < 2 or max_logits_batch.shape[0] != num_layers or max_logits_batch.shape[-1] != num_heads:
+      raise ValueError(
+          f"QK-Clip: scanned kernel {param.shape} (layers on axis {param_scan_axis}) does not match max_logits"
+          f" {max_logits_batch.shape}; expected [layers, ..., heads]."
+      )
+    s_max = jnp.max(max_logits_batch, axis=tuple(range(1, max_logits_batch.ndim - 1)))  # [layers, heads]
+    scale = _clip_scale(s_max, tau, denominator_eps)
+    shape = [1] * param.ndim
+    shape[param_scan_axis], shape[-2] = num_layers, num_heads
+    return scale.reshape(shape)
+  return jnp.expand_dims(_scale_from_max_logits(max_logits_batch, tau, denominator_eps), axis=-1)
+
+
+def _clip_mla_weight(layer_name, param, scale_b, qk_nope):
+  """Apply a per-(layer,) head scale, already shaped to broadcast against the kernel, to a wq_b or wkv_b kernel."""
   head = param[..., :qk_nope]
   tail = param[..., qk_nope:]
   head_new = head * jnp.sqrt(scale_b)
@@ -128,8 +164,14 @@ def apply_qk_clip(state, intermediate_outputs, config):
     if max_logits_batch is None:
       return param
 
-    scale = _scale_from_max_logits(max_logits_batch, tau)
-    return _clip_mla_weight(layer_name, param, scale, config.qk_nope_head_dim)
+    scale_b = _kernel_scale(
+        max_logits_batch,
+        param,
+        tau,
+        getattr(config, "param_scan_axis", 1),
+        0.0 if getattr(config, "qk_clip_mcore_denominator", False) else 1e-6,
+    )
+    return _clip_mla_weight(layer_name, param, scale_b, config.qk_nope_head_dim)
 
   new_params = jax.tree_util.tree_map_with_path(clip_mla_weights, state.params)
   return state.replace(params=new_params)
@@ -172,10 +214,52 @@ def apply_qk_clip_nnx(state, intermediate_outputs, config):
     if max_logits_batch is None:
       return param
 
-    scale = _scale_from_max_logits(max_logits_batch, tau)
-    return _clip_mla_weight(layer_name, param, scale, config.qk_nope_head_dim)
+    scale_b = _kernel_scale(
+        max_logits_batch,
+        param,
+        tau,
+        getattr(config, "param_scan_axis", 1),
+        0.0 if getattr(config, "qk_clip_mcore_denominator", False) else 1e-6,
+    )
+    return _clip_mla_weight(layer_name, param, scale_b, config.qk_nope_head_dim)
 
   new_params_dict = jax.tree_util.tree_map_with_path(clip_mla_weights, params_dict)
   nnx.replace_by_pure_dict(params_state, new_params_dict)
   nnx.update(state.model, params_state)
   return state
+
+
+def per_head_stats(params_dict, intermediate_outputs, config):
+  """Per-(layer,) head max logit and QK-Clip scale of every attention module that QK-Clip touches (qk_clip_log_per_head).
+
+  Walks the same paths as apply_qk_clip_nnx (each wq_b kernel and the max_logits sown beside it) and reduces the
+  max_logits the same way as _kernel_scale. Returns {"<module path>": [2, (layers,) heads]} with row 0 the max logit
+  and row 1 the scale min(1, tau / (max logit + eps)). Logging only.
+  """
+  tau = float(config.qk_clip_threshold)
+  eps = 0.0 if getattr(config, "qk_clip_mcore_denominator", False) else 1e-6
+  scan_axis = getattr(config, "param_scan_axis", 1)
+  out = {}
+
+  def visit(path, param):
+    if len(path) < 2 or _get_key_name(path[-2]) != "wq_b":
+      return
+    curr = intermediate_outputs
+    for node in path[:-2]:
+      key = _get_key_name(node)
+      if not (isinstance(curr, dict) and key in curr):
+        return
+      curr = curr[key]
+    ml = _max_logits_at(curr)
+    if ml is None:
+      return
+    if param.ndim == 4:
+      s_max = jnp.max(ml, axis=tuple(range(1, ml.ndim - 1)))  # [layers, heads]
+      if s_max.shape != (param.shape[scan_axis], param.shape[-2]):
+        raise ValueError(f"QK-Clip: max_logits {ml.shape} do not match the scanned kernel {param.shape}.")
+    else:
+      s_max = jnp.max(ml, axis=tuple(range(ml.ndim - 1)))  # [heads]
+    out["/".join(_get_key_name(k) for k in path[:-2])] = jnp.stack([s_max, _clip_scale(s_max, tau, eps)])
+
+  jax.tree_util.tree_map_with_path(visit, params_dict)
+  return out

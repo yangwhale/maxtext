@@ -838,6 +838,8 @@ class TestTrainingLoopIterationEvalRetry(unittest.TestCase):
       with_first_phase=False,
       first_phase_overflow=False,
       required_rbf=None,
+      dropless_retry=True,
+      train_overflow=False,
   ):
     """Runs training_loop_iteration with fake step fns and returns (eval loss used, dropless call count).
 
@@ -857,7 +859,7 @@ class TestTrainingLoopIterationEvalRetry(unittest.TestCase):
       del batch, rng_args
       if train_calls is not None:
         train_calls.append("normal")
-      return state, _train_metrics()
+      return state, _train_metrics(overflow=train_overflow)
 
     def p_train_step_dropless(state, batch, *rng_args):
       del batch, rng_args
@@ -892,6 +894,8 @@ class TestTrainingLoopIterationEvalRetry(unittest.TestCase):
         first_phase_ragged_buffer_factor=5.0 if with_first_phase else 0.0,
         log_required_ragged_buffer_factor=required_rbf is not None,
         logical_axis_rules_for_eval=(),
+        moe_dropless_retry=dropless_retry,
+        ragged_buffer_factor=2.0,
     )
     metric_logger_instance = mock.MagicMock()
     data_loader = mock.MagicMock()
@@ -961,6 +965,41 @@ class TestTrainingLoopIterationEvalRetry(unittest.TestCase):
 
   def test_keeps_primary_metrics_when_flag_off(self):
     used_loss, dropless_call_count = self._run(step_fallback=False, has_overflow=True, with_dropless=True)
+    self.assertEqual(used_loss, self._PRIMARY_LOSS)
+    self.assertEqual(dropless_call_count, 0)
+
+  def test_train_overflow_without_dropless_retry_raises(self):
+    # moe_dropless_retry=False builds no dropless program: an overflowing train step stops training.
+    with self.assertRaisesRegex(RuntimeError, "moe_dropless_retry=False"):
+      self._run(step_fallback=True, has_overflow=False, with_dropless=False, dropless_retry=False, train_overflow=True)
+
+  def test_eval_overflow_without_dropless_retry_logs_and_continues(self):
+    # Eval does not change the train state: an overflowing eval step is reported, not fatal.
+    with mock.patch.object(pre_train.max_logging, "error") as log_error:
+      used_loss, dropless_call_count = self._run(
+          step_fallback=True, has_overflow=True, with_dropless=False, dropless_retry=False
+      )
+    self.assertEqual(used_loss, self._PRIMARY_LOSS)
+    self.assertEqual(dropless_call_count, 0)
+    self.assertIn("Eval step", log_error.call_args.args[0])
+
+  def test_step_fallback_graphdefs_skip_dropless_without_retry(self):
+    cfg = pytypes.SimpleNamespace(moe_dropless_fallback="step", moe_dropless_retry=False)
+    with mock.patch.object(pre_train, "build_dropless_graphdef") as dropless, mock.patch.object(
+        pre_train, "build_first_phase_graphdef"
+    ) as first_phase:
+      self.assertEqual(pre_train.build_step_fallback_graphdefs(cfg, "model", "state"), (None, None))
+      dropless.assert_not_called()
+      first_phase.assert_not_called()
+      cfg.moe_dropless_retry = True
+      self.assertEqual(
+          pre_train.build_step_fallback_graphdefs(cfg, "model", "state"), (dropless.return_value, first_phase.return_value)
+      )
+
+  def test_no_overflow_without_dropless_retry_keeps_primary_metrics(self):
+    used_loss, dropless_call_count = self._run(
+        step_fallback=True, has_overflow=False, with_dropless=False, dropless_retry=False
+    )
     self.assertEqual(used_loss, self._PRIMARY_LOSS)
     self.assertEqual(dropless_call_count, 0)
 

@@ -60,6 +60,7 @@ from maxtext.common.common_types import (
     MODEL_MODE_AUTOREGRESSIVE,
     MODEL_MODE_PREFILL,
     MODEL_MODE_TRAIN,
+    PLAIN_CAUSAL_ATTENTION_TYPES,
     PREFILL_LENGTH,
     Q_LENGTH,
 )
@@ -72,6 +73,7 @@ from maxtext.kernels.attention.ragged_attention import ragged_gqa
 from maxtext.kernels.attention.ragged_attention import ragged_mha
 from maxtext.layers import nnx_wrappers
 from maxtext.layers.quantizations import AqtQuantization as Quant
+from maxtext.utils import max_logging
 from maxtext.utils import max_utils
 from maxtext.utils.sharding import get_logical_axis_rules, logical_to_mesh_axes, maybe_shard_with_pspec
 import numpy as np
@@ -79,6 +81,9 @@ from tokamax._src.ops.attention import base as tokamax_attention_base
 from tokamax._src.ops.attention import pallas_triton as tokamax_pallas_triton
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as tokamax_splash_kernel
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask as tokamax_splash_mask
+from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask_info as tokamax_splash_mask_info
+from maxtext.kernels import splash_dsinks_fp32
+from maxtext.kernels import splash_dsinks_gpu_order
 # pylint: disable=line-too-long, g-doc-args, g-doc-return-or-yield, bad-continuation, g-inconsistent-quotes
 # pytype: disable=attribute-error
 
@@ -157,6 +162,28 @@ def validate_gpu_flash_attention(
     )
   if record_max_logits:
     raise NotImplementedError("record_max_logits (QK-Clip) is not supported for GPU flash attention kernels yet.")
+
+
+@jax.custom_vjp
+def _cotangent_as_primal_dtype(x: Array) -> Array:
+  """Identity whose backward casts the incoming cotangent to the primal dtype.
+
+  The tokamax splash backward returns d_sinks in the attention output dtype (bf16) even for float32 sinks; the
+  mismatched cotangent then trips the dtype check of the sharding-constraint transpose in front of the kernel.
+  This only restores the dtype: d_sinks has already been accumulated in bf16 inside the kernel.
+  """
+  return x
+
+
+def _cotangent_as_primal_dtype_fwd(x):
+  return x, jnp.zeros((), x.dtype)
+
+
+def _cotangent_as_primal_dtype_bwd(dtype_token, ct):
+  return (ct.astype(dtype_token.dtype),)
+
+
+_cotangent_as_primal_dtype.defvjp(_cotangent_as_primal_dtype_fwd, _cotangent_as_primal_dtype_bwd)
 
 
 def _sinks_to_te_softmax_offset(sinks: Array, num_query_heads: int) -> Array:
@@ -434,6 +461,140 @@ class HCAStaticMask(splash_attention_mask.Mask):
     )
 
 
+# Static causal schedule for the DSA indexer mask (`splash_static_causal_partial_mask`).
+#
+# `make_dynamic_splash_mha` derives its block schedule (active rows / cols, mask_next, num_active_blocks) from the
+# runtime mask. Those arrays are Pallas scalar-prefetch operands and grid bounds, so under the per-batch `jax.vmap`
+# they carry a batch dimension and `pallas_call`'s batching rule falls back to `_batch_with_explicit_loop` (one
+# kernel launch per batch element, with dynamic-slice / dynamic-update-slice around it). The dynamic mode also forces
+# `dq_reduction_steps=3`. The path below keeps the schedule static and batch-independent (the causal block pattern,
+# every visited block marked partial) and feeds the runtime mask only as the per-block tile array
+# `partial_mask_blocks`, an ordinary blocked operand that `vmap` folds into the grid.
+#
+# It uses tokamax private helpers of `splash_attention_mask_info` (listed in
+# common_types.SPLASH_STATIC_CAUSAL_TOKAMAX_HELPERS), verified against tokamax 0.0.16; the config validation checks
+# they exist when the flag is on, so a tokamax without them fails at config time rather than at trace time.
+
+
+@functools.lru_cache(maxsize=16)
+def _static_causal_schedule(
+    q_len: int, kv_len: int, block_q: int, block_kv: int, is_dkv: bool, compact_grid: bool
+) -> tuple[tokamax_splash_mask_info.MaskInfo, float]:
+  """Tokamax MaskInfo (without tiles) that visits every block holding a causal (kv <= q) element, and the visited
+  fraction of the full block grid (the kernel's cost-estimate sparsity).
+
+  Each visited block is marked partial, and its `mask_next` entry is its row-major id `i * kv_blocks + j`, the
+  index of its tile in tokamax `_process_dynamic_mask(...).partial_mask_blocks`. Blocks entirely above the diagonal
+  are never visited, so the runtime mask must be zero there. `compact_grid` lists only visited blocks (tokamax's
+  "dynamic grid" layout, here with constant arrays); otherwise the kernel walks every block and skips the unvisited
+  ones (block_mask 0). The sparsity is not taken from the compact grid, where every listed block is visited.
+  """
+  rows = np.arange(q_len // block_q, dtype=np.int32)[:, None]
+  cols = np.arange(kv_len // block_kv, dtype=np.int32)[None, :]
+  visited = cols * block_kv <= (rows + 1) * block_q - 1
+  tile_ids = np.where(visited, np.arange(visited.size, dtype=np.int32).reshape(visited.shape), -1).astype(np.int32)
+  # pylint: disable=protected-access
+  active_rows, active_cols, mask_next, block_mask, grid_size = tokamax_splash_mask_info._generate_shard_metadata(
+      visited.astype(np.int32), tile_ids, is_dkv, compact_grid
+  )
+  downcast = tokamax_splash_mask_info._downcast_to_small_type
+  # pylint: enable=protected-access
+  info = tokamax_splash_mask_info.MaskInfo(
+      mask_next=downcast(mask_next),
+      active_rows=None if active_rows is None else downcast(active_rows),
+      active_cols=None if active_cols is None else downcast(active_cols),
+      block_mask=downcast(block_mask.astype(np.int32)),
+      num_active_blocks=None if grid_size is None else np.array([grid_size], dtype=np.int32),
+      partial_mask_blocks=None,
+      q_sequence=None,
+  )
+  return info, float(visited.mean())
+
+
+def static_causal_partial_mask_splash(
+    q: Array,
+    k: Array,
+    v: Array,
+    segment_ids: Any,
+    sinks: Array | None,
+    mask: Array,
+    *,
+    config: Any,
+    max_logit_value: Array | None = None,
+    save_residuals: bool = False,
+):
+  """Single-example Tokamax splash MHA: static causal block schedule, `mask` applied elementwise.
+
+  Requires `mask` (bool [q_len, kv_len]) to be zero wherever kv > q: the schedule never visits blocks entirely
+  above the diagonal. Segment ids are folded into the tile mask (the kernel applies `q_seg == kv_seg` elementwise
+  in the same way), so the kernel gets no segment ids and keeps the static schedule in the backward pass as well.
+  The fold is kept even though the MLA indexer mask already carries the segment constraint: it is what makes the
+  result independent of how the caller built the mask, and whether ids are all equal is only known at run time.
+  Meant to be `jax.vmap`-ed over the batch.
+
+  Compared with `make_dynamic_splash_mha(mask=mask, config=config)(q, k, v, segment_ids, sinks=sinks)`: a visited
+  block whose mask is all zero is still computed, and for a row that keeps at least one key its masked logits
+  contribute exactly zero (exp(mask_value - m) == 0), so such rows match and emptiness only costs time. A row with
+  no key left after the segment fold differs when there are neither sinks nor a max-logit estimate: the running max
+  then stays at mask_value, every masked logit gets weight 1, and the row becomes the mean of V over the visited
+  blocks, which are a different set here than in the dynamic schedule. With sinks (Hy4) or a max-logit estimate
+  such a row is 0 in both paths.
+
+  dQ: with dq_reduction_steps unset, tokamax's static dKV grid writes one dQ slice per kv block, a
+  [kv_steps, heads, q_len, head_dim] buffer (fp32 once kv_steps > 4). Past 3 kv blocks this switches to the
+  3-slot ring the dynamic path always uses, so the buffer stays bounded (3 slots in the q dtype).
+
+  TODO: `partial_mask_blocks` holds all q_blocks * kv_blocks tiles (fwd and dKV each; the dKV copy is a residual)
+  although the schedule never reads the ones above the diagonal. Gathering only the visited tiles would save almost
+  half of that HBM; at seq 4096 it is 2 x 16 MiB int8 per example, so it is left as the layout tokamax builds.
+  """
+  if getattr(config, "qk_diag_skip", False) or getattr(config, "sv_diag_skip", False):
+    raise ValueError("splash_static_causal_partial_mask: qk_diag_skip / sv_diag_skip would skip masked-in elements.")
+  if segment_ids is not None:
+    mask = mask & (segment_ids.q[:, None] == segment_ids.kv[None, :])
+  q_len, kv_len = mask.shape
+  if config.has_backward_blocks and config.dq_reduction_steps is None and kv_len // config.block_kv_dkv > 3:
+    config = dataclasses.replace(config, dq_reduction_steps=3)
+
+  def mask_info(block_q, block_kv, is_dkv, compact_grid):
+    schedule, sparsity = _static_causal_schedule(q_len, kv_len, block_q, block_kv, is_dkv, compact_grid)
+    # pylint: disable-next=protected-access
+    tiles = tokamax_splash_mask_info._process_dynamic_mask(mask, (block_q, block_kv), is_dkv).partial_mask_blocks
+    return jax.tree.map(jnp.asarray, schedule)._replace(partial_mask_blocks=tiles), sparsity
+
+  fwd_info, fwd_sparsity = mask_info(config.block_q, config.block_kv, False, True)
+  dkv_info, dkv_sparsity = None, 1.0
+  if config.has_backward_blocks:
+    # Same grid choice as tokamax `_make_splash_attention`: the compact dKV grid only with dq_reduction_steps=3.
+    dkv_info, dkv_sparsity = mask_info(config.block_q_dkv, config.block_kv_dkv, True, config.dq_reduction_steps == 3)
+  kernel = tokamax_splash_kernel.SplashAttentionKernel(
+      fwd_info,
+      dkv_info,
+      config=config,
+      is_mqa=False,
+      save_residuals=False,
+      mask_value=DEFAULT_MASK_VALUE,
+      mask_function=None,
+      fwd_mask_sparsity=fwd_sparsity,
+      dkv_mask_sparsity=dkv_sparsity,
+  )
+  return kernel(q, k, v, None, sinks=sinks, max_logit_value=max_logit_value, save_residuals=save_residuals)
+
+
+def static_causal_local_shapes_match(query: Array, key: Array, mask: Array, q_len: int, kv_len: int) -> bool:
+  """Inside the kernel shard_map: q, kv and the indexer mask all cover the full, unsharded sequences.
+
+  The static schedule assumes block row / column i is sequence block i of the full sequence.
+  """
+  return query.shape[2] == mask.shape[-2] == q_len and key.shape[2] == mask.shape[-1] == kv_len
+
+
+@functools.lru_cache(maxsize=None)
+def _log_once(message: str, warning: bool = False) -> None:
+  """Logs `message` (INFO, or WARNING) the first time it is seen in this process; layers and retraces repeat it."""
+  (max_logging.warning if warning else max_logging.log)(message)
+
+
 def _generate_chunk_attention_mask(mask_shape: tuple[int, int], chunk_size: int, q_offset: int = 0) -> jax.Array:
   """Generates an explicit boolean mask for chunked causal attention.
 
@@ -529,6 +690,26 @@ def _make_bidirectional_block_mask(bidirectional_mask):
   return bidirectional_block_mask
 
 
+def max_logits_excluding_sink(query, key, indexer_mask=None, decoder_segment_ids=None):
+  """Per-(batch, head) max of the scaled q.k over the attended positions, sink not included (qk_clip_max_logit_exclude_sink).
+
+  query [batch, q_len, heads, dim] (already scaled), key [batch, kv_len, heads, dim]. Attended = causal, and the indexer
+  top-k mask (additive, 0 = attend) when given, and the same segment when segment ids are given. Statistics only: no
+  gradient flows through it.
+  """
+  query = jax.lax.stop_gradient(query)
+  key = jax.lax.stop_gradient(key)
+  logits = jnp.einsum("bqhd,bkhd->bhqk", query, key, preferred_element_type=jnp.float32)
+  q_len, kv_len = logits.shape[-2], logits.shape[-1]
+  allowed = jnp.tril(jnp.ones((q_len, kv_len), dtype=jnp.bool_), k=kv_len - q_len)[None, None]
+  if indexer_mask is not None:
+    allowed = allowed & (jax.lax.stop_gradient(indexer_mask) == 0.0)[:, None, :, :]
+  if decoder_segment_ids is not None:
+    seg = decoder_segment_ids
+    allowed = allowed & (seg[:, None, :, None] == seg[:, None, None, :kv_len])
+  return jnp.max(jnp.where(allowed, logits, -jnp.inf), axis=(2, 3))
+
+
 class AttentionOp(nnx.Module):
   """Attention operation"""
 
@@ -618,6 +799,8 @@ class AttentionOp(nnx.Module):
         nnx.to_linen wrapper.
     """
     self.config = config
+    if getattr(config, "splash_dsinks_fp32", False) or splash_dsinks_fp32.is_enabled():
+      splash_dsinks_fp32.set_enabled(getattr(config, "splash_dsinks_fp32", False))
     self.mesh = mesh
     self.attention_kernel = attention_kernel
     self.max_target_length = max_target_length
@@ -1497,6 +1680,57 @@ class AttentionOp(nnx.Module):
     moba_mask = jax.vmap(self.generate_moba_mask_single_item, in_axes=(0, 0, None))(query, key, q_positions)
     return moba_mask
 
+  def _use_splash_static_causal_partial_mask(
+      self,
+      *,
+      sa_config: Any,
+      model_mode: str,
+      previous_chunk: Any,
+      bidirectional_mask: Any,
+      cp_size: int,
+      context_parallel_kernel: bool,
+      q_len: int,
+      kv_len: int,
+      has_sinks: bool,
+  ) -> bool:
+    """Whether this call takes the static causal schedule; otherwise it keeps the existing indexer-mask path.
+
+    The schedule never visits blocks entirely above the diagonal, so the indexer mask must be contained in the
+    plain (offset-0, square) causal mask. The MLA indexer adds the layer's attention mask after top-k, which is that
+    causal mask for the PLAIN_CAUSAL_ATTENTION_TYPES in training. With IndexCache the mask comes from another layer;
+    every DeepSeek MLA layer has the config's attention_type, which the config validation restricts to the same
+    types, together with the multimodal and block-size conditions it can see. Anything else that rules the static
+    schedule out here (context parallelism, inference modes, chunked prefill, a runtime bidirectional mask, odd
+    shapes) keeps the dynamic path and logs the reason once, so a training config with the flag still runs.
+    """
+    reasons = []
+    if context_parallel_kernel or cp_size > 1:
+      reasons.append(f"context parallelism (cp_size={cp_size}, strategy={self.config.context_parallel_strategy!r})")
+    if model_mode != MODEL_MODE_TRAIN or previous_chunk is not None:
+      reasons.append(f"model_mode={model_mode!r}{' with chunked prefill' if previous_chunk is not None else ''}")
+    if self.attention_type not in PLAIN_CAUSAL_ATTENTION_TYPES:
+      reasons.append(f"attention_type={self.attention_type.value!r} is not plain causal")
+    if bidirectional_mask is not None or self.config.use_multimodal:
+      reasons.append("bidirectional (multimodal) masking admits kv > q")
+    if q_len != kv_len:
+      reasons.append(f"q_len={q_len} != kv_len={kv_len}")
+    blocks = [("block_q", sa_config.block_q, q_len), ("block_kv", sa_config.block_kv, kv_len)]
+    if sa_config.has_backward_blocks:
+      blocks += [("block_q_dkv", sa_config.block_q_dkv, q_len), ("block_kv_dkv", sa_config.block_kv_dkv, kv_len)]
+    reasons += [f"{name}={block} does not divide {length}" for name, block, length in blocks if length % block]
+    if getattr(sa_config, "qk_diag_skip", False) or getattr(sa_config, "sv_diag_skip", False):
+      reasons.append("qk_diag_skip / sv_diag_skip")
+    if reasons:
+      _log_once("splash_static_causal_partial_mask: keeping the existing indexer-mask path for " + "; ".join(reasons))
+      return False
+    if not has_sinks and sa_config.max_logit_const is None:
+      _log_once(
+          "splash_static_causal_partial_mask without attention sinks or a max-logit estimate: a row that keeps no"
+          " key after the segment fold gets a different (equally meaningless) output than the dynamic path.",
+          warning=True,
+      )
+    return True
+
   def _validate_tpu_tokamax_ring_runtime(
       self,
       *,
@@ -1706,6 +1940,12 @@ class AttentionOp(nnx.Module):
             pad_kv_total=pad_kv_total,
             compress_ratio=compress_ratio,
         )
+        if (
+            max_logits is not None
+            and sinks is not None
+            and getattr(self.config, "qk_clip_max_logit_exclude_sink", False)
+        ):
+          max_logits = max_logits_excluding_sink(query, key, indexer_mask, decoder_segment_ids)
         if max_logits is not None:
           self.max_logits = nnx.Intermediate(max_logits)
         return out, None, None
@@ -2296,6 +2536,20 @@ class AttentionOp(nnx.Module):
           is_leaf=lambda x: x is None,
       )
 
+    use_static_causal_partial_mask = indexer_mask is not None and self.config.splash_static_causal_partial_mask
+    if use_static_causal_partial_mask:
+      use_static_causal_partial_mask = self._use_splash_static_causal_partial_mask(
+          sa_config=sa_config,
+          model_mode=model_mode,
+          previous_chunk=previous_chunk,
+          bidirectional_mask=bidirectional_mask,
+          cp_size=cp_size,
+          context_parallel_kernel=use_tokamax_ring or use_ulysses or use_usp,
+          q_len=orig_q_len,
+          kv_len=orig_kv_len,
+          has_sinks=sinks is not None,
+      )
+
     # wrap_flash_attention receives Q/K/V and mask metadata with the shardings
     # specified in the shard_map in_specs below. For the all-gather path Q is
     # sequence-sharded and K/V are replicated. For the Tokamax ring path Q, K,
@@ -2525,15 +2779,50 @@ class AttentionOp(nnx.Module):
             else:
               return kernel(q, k_in, v_in, segment, sinks=sinks), None
 
-          # Iterate over batch dimension for (query, key, value, segment, sinks, mask)
-          attn_fn = jax.vmap(dynamic_mask_splash_kernel, (0, 0, 0, 0, None, 0))
+          use_static_here = use_static_causal_partial_mask
+          if use_static_here and not static_causal_local_shapes_match(query, key, indexer_mask, orig_q_len, orig_kv_len):
+            _log_once(
+                "splash_static_causal_partial_mask: keeping the existing indexer-mask path, the kernel shard_map sees"
+                f" q {query.shape[2]}, kv {key.shape[2]}, mask {tuple(indexer_mask.shape[-2:])} of the full"
+                f" ({orig_q_len}, {orig_kv_len}) sequences"
+            )
+            use_static_here = False
+          if use_static_here:
 
-          if record_max_logits:
-            attention_output, max_logits = attn_fn(query, key, value, decoder_segment_ids_tuple, sinks, indexer_mask)
-            return attention_output, max_logits
+            def static_mask_splash_kernel(q, k, v, segment, sinks, indexer_mask):
+              ret = static_causal_partial_mask_splash(
+                  q,
+                  k,
+                  v,
+                  segment,
+                  sinks,
+                  indexer_mask,
+                  config=sa_config,
+                  max_logit_value=max_logit_value,
+                  save_residuals=record_max_logits,
+              )
+              return (ret[0], ret[1]["max_logits"]) if record_max_logits else (ret, None)
+
+            attn_fn = jax.vmap(static_mask_splash_kernel, (0, 0, 0, 0, None, 0))
           else:
-            attention_output, _ = attn_fn(query, key, value, decoder_segment_ids_tuple, sinks, indexer_mask)
-            return attention_output, None
+            # Iterate over batch dimension for (query, key, value, segment, sinks, mask)
+            attn_fn = jax.vmap(dynamic_mask_splash_kernel, (0, 0, 0, 0, None, 0))
+
+          gpu_order = sinks is not None and getattr(self.config, "splash_dsinks_gpu_order", False)
+          kernel_sinks = jax.lax.stop_gradient(sinks) if gpu_order else sinks
+          attention_output, max_logits = attn_fn(query, key, value, decoder_segment_ids_tuple, kernel_sinks, indexer_mask)
+          if gpu_order:
+            # splash_dsinks_gpu_order: the kernel's own sink gradient is dropped (stop_gradient above); the sink gets
+            # Megatron-Core's -sum_q p_sink * sum_j p_j * bf16(dp_j), recomputed outside the kernel.
+            allowed = indexer_mask[:, : query.shape[2], : key.shape[2]]
+            if decoder_segment_ids_tuple is not None:
+              seg_q, seg_kv = decoder_segment_ids_tuple
+              allowed = allowed & (seg_q[:, :, None] == seg_kv[:, None, :])
+            attention_output = jax.vmap(
+                lambda o, s, q, k, v, m: splash_dsinks_gpu_order.with_gpu_order_sink_grad(o, s, q, k, v, m),
+                in_axes=(0, None, 0, 0, 0, 0),
+            )(attention_output, sinks, query, key, value, allowed)
+          return attention_output, (max_logits if record_max_logits else None)
         else:
           kernel = partial(splash_kernel, max_logit_value=max_logit_value)
           is_mqa_compressed = self.attention_type == AttentionType.COMPRESSED and self.num_kv_heads == 1
@@ -2595,6 +2884,8 @@ class AttentionOp(nnx.Module):
     decoder_segment_ids_q = self._maybe_shard_with_pspec(decoder_segment_ids, segment_axis_names_q)
     decoder_segment_ids_kv = self._maybe_shard_with_pspec(decoder_segment_ids_kv_in, segment_axis_names_kv)
     sinks = self._maybe_shard_with_pspec(sinks, sink_axis_names)
+    if sinks is not None:
+      sinks = _cotangent_as_primal_dtype(jnp.asarray(sinks))
     indexer_mask = self._maybe_shard_with_pspec(indexer_mask, indexer_mask_axis_names)
 
     ret = wrap_flash_attention(

@@ -23,6 +23,7 @@ from flax import nnx
 import flax.linen as nn
 from flax.linen import partitioning as nn_partitioning
 import jax
+from jax._src import ad_checkpoint
 import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
@@ -1293,6 +1294,80 @@ class RoutedMoeTest(parameterized.TestCase):
         ragged_gather_fallback=False,
         ragged_gather_reduce_fallback=False,
     )
+
+  def test_routed_and_shared_moe_tags_moe_out(self):
+    """RoutedAndSharedMoE names its output "moe_out", so the custom remat policy can keep it (moe_out=device)."""
+    cfg = pyconfig.initialize(
+        [None, get_test_config_path()],
+        run_name="moe_out_tag",
+        enable_checkpointing=False,
+        model_name="deepseek3-test",
+        sparse_matmul=False,
+        megablox=False,
+        per_device_batch_size=1,
+        max_target_length=8,
+        dtype="float32",
+    )
+    mesh = Mesh(maxtext_utils.create_device_mesh(cfg), cfg.mesh_axes)
+    with jax.set_mesh(mesh), nn_partitioning.axis_rules(cfg.logical_axis_rules):
+      block = moe.RoutedAndSharedMoE(
+          config=cfg,
+          mesh=mesh,
+          kernel_init=nd_dense_init(1.0, "fan_in", "truncated_normal"),
+          kernel_axes=("embed", None),
+          dtype=cfg.dtype,
+          weight_dtype=cfg.weight_dtype,
+          rngs=nnx.Rngs(0),
+      )
+      x = jnp.ones((1, cfg.max_target_length, cfg.emb_dim), dtype=cfg.dtype)
+      jaxpr = jax.make_jaxpr(lambda inputs: block(inputs)[0])(x)
+    self.assertIn("name=moe_out", str(jaxpr))
+
+  def test_moe_expert_weights_saved_across_remat(self):
+    """Under a remat saving only "moe_expert_weights", the residuals are the gathered bf16 expert weights (outputs of the
+    sparse_matmul shard_map); with any other name they are the FSDP-sharded float32 parameters, which the rematted
+    forward has to all-gather again. Fails if the tag is dropped or stops reaching the outer remat."""
+    cfg = pyconfig.initialize(
+        [None, get_test_config_path()],
+        run_name="moe_expert_weights_tag",
+        enable_checkpointing=False,
+        model_name="mixtral-8x7b",
+        override_model_config=True,
+        base_emb_dim=256,
+        base_mlp_dim=256,
+        base_moe_mlp_dim=256,
+        dtype="bfloat16",
+        weight_dtype="float32",
+        megablox=False,
+        sparse_matmul=True,
+        per_device_batch_size=1,
+        max_target_length=16,
+    )
+    mesh = Mesh(maxtext_utils.create_device_mesh(cfg), cfg.mesh_axes)
+    model = moe.get_routed_moe(
+        name="MoeBlock",
+        config=cfg,
+        num_experts=cfg.num_experts,
+        num_experts_per_tok=cfg.num_experts_per_tok,
+        mesh=mesh,
+        kernel_init=nd_dense_init(1.0, "fan_in", "truncated_normal"),
+        kernel_axes=("embed", "mlp"),
+        intermediate_dim=cfg.mlp_dim,
+        dtype=cfg.dtype,
+    )
+    x = jax.random.uniform(jax.random.PRNGKey(0), (jax.device_count(), 16, 256), dtype=jnp.bfloat16)
+
+    def gathered_weight_residuals(name):
+      f = jax.checkpoint(
+          lambda p, x: model.apply({"params": p}, x)[0], policy=jax.checkpoint_policies.save_only_these_names(name)
+      )
+      res = ad_checkpoint.saved_residuals(lambda p, x: jnp.sum(f(p, x).astype(jnp.float32)), params, x)
+      return [a for a, desc in res if a.dtype == jnp.bfloat16 and "output of shard_map" in desc]
+
+    with jax.set_mesh(mesh), nn_partitioning.axis_rules(cfg.logical_axis_rules):
+      params = model.init({"params": jax.random.PRNGKey(0), "dropout": jax.random.PRNGKey(0)}, x)["params"]
+      self.assertLen(gathered_weight_residuals("moe_expert_weights"), 3)  # w0, w1, wo
+      self.assertEmpty(gathered_weight_residuals("no_such_name"))
 
   def _moe_routing_maps_cfg(self, moe_routing_maps: str):
     """Tiny ring-of-experts ragged-sort MoE config (EP2) for the moe_routing_maps test."""
@@ -3906,6 +3981,110 @@ class RequiredRaggedBufferFactorTest(unittest.TestCase):
     # The required factor is the smallest that keeps get_ragged_buffer_size >= the shard's token count.
     self.assertEqual(moe.RoutedMoE.get_ragged_buffer_size(8, 2, 4, 2, 1.5), 12)
     self.assertLess(moe.RoutedMoE.get_ragged_buffer_size(8, 2, 4, 2, 1.49), 12)
+
+
+class Hy4RoutingOptionsTest(unittest.TestCase):
+  """DeepSeek-V3 style routing list, weight renormalization, SwiGLU clip gradient, zero-mean bias update."""
+
+  def test_hy4_is_routed_deepseek_v3_style(self):
+    self.assertTrue("hy4-preview".startswith(moe.DEEPSEEK_V3_STYLE_ROUTING_MODELS))
+    self.assertTrue("deepseek3-671b".startswith(moe.DEEPSEEK_V3_STYLE_ROUTING_MODELS))
+    self.assertFalse("qwen3-30b-a3b".startswith(moe.DEEPSEEK_V3_STYLE_ROUTING_MODELS))
+    mesh = Mesh(np.array(jax.devices()[:1]), ("fsdp",))
+
+    def gate(model_name):
+      return moe.GateLogit(
+          in_features_shape=8, out_features_shape=4, model_name=model_name, mesh=mesh, rngs=nnx.Rngs(0), use_bias=True
+      )
+
+    # DeepSeek-V3 style: the correction bias is a MoEBiasVar (kept out of gradient updates)
+    # and the gate also returns the pre-bias logits.
+    hy4_gate = gate("hy4-preview")
+    self.assertIsInstance(hy4_gate.bias, moe.MoEBiasVar)
+    _, pre_bias = hy4_gate(jnp.ones((1, 2, 8)))
+    self.assertIsNotNone(pre_bias)
+    self.assertNotIsInstance(gate("qwen3-30b-a3b").bias, moe.MoEBiasVar)
+
+  def test_routed_weight_normalize(self):
+    def scale(normalize, score_func="sigmoid"):
+      cfg = SimpleNamespace(routed_weight_normalize=normalize, routed_score_func=score_func, routed_scaling_factor=2.0)
+      return np.asarray(moe.RoutedMoE.deepseek_scale_weights(SimpleNamespace(config=cfg), jnp.array([[0.2, 0.3]])))
+
+    np.testing.assert_allclose(scale(None), [[0.8, 1.2]], rtol=1e-6)  # previous behaviour for sigmoid scores
+    np.testing.assert_allclose(scale(None, "softmax"), [[0.4, 0.6]], rtol=1e-6)
+    np.testing.assert_allclose(scale(False), [[0.4, 0.6]], rtol=1e-6)
+    np.testing.assert_allclose(scale(True, "softmax"), [[0.8, 1.2]], rtol=1e-6)
+
+  def test_swiglu_clip_gradient_at_bound(self):
+    limit = 10.0
+    w0 = jnp.array([9.0, 10.0, 11.0])
+    w1 = jnp.array([-11.0, -10.0, 0.0, 10.0, 11.0])
+
+    def grads(inclusive):
+      f = lambda a, b: sum(jnp.sum(o) for o in moe.clip_swiglu_inputs(a, b, limit, inclusive))
+      return [np.asarray(g) for g in jax.grad(f, argnums=(0, 1))(w0, w1)]
+
+    g0, g1 = grads(True)
+    np.testing.assert_array_equal(g0, [1.0, 1.0, 0.0])
+    np.testing.assert_array_equal(g1, [0.0, 1.0, 1.0, 1.0, 0.0])
+    # jnp.clip splits the gradient at the bound; the inclusive variant must differ exactly there.
+    c0, c1 = grads(False)
+    np.testing.assert_array_equal(c0, [1.0, 0.5, 0.0])
+    np.testing.assert_array_equal(c1, [0.0, 0.5, 1.0, 0.5, 0.0])
+    for a, b in zip(moe.clip_swiglu_inputs(w0, w1, limit, True), moe.clip_swiglu_inputs(w0, w1, limit, False)):
+      np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+  def test_zero_mean_bias_update(self):
+    from maxtext.trainers.pre_train import train  # pylint: disable=import-outside-toplevel
+
+    # 16 experts, 5 under-loaded (+rate) and 11 over-loaded (-rate), rate 0.001.
+    update = jnp.array([[0.001] * 5 + [-0.001] * 11])
+    out = np.asarray(train._maybe_zero_mean_bias_update(update, SimpleNamespace(routed_bias_zero_mean_update=True)))
+    np.testing.assert_allclose(out, [[0.001375] * 5 + [-0.000625] * 11], rtol=1e-5)
+    np.testing.assert_allclose(out.sum(-1), [0.0], atol=1e-9)
+    off = train._maybe_zero_mean_bias_update(update, SimpleNamespace(routed_bias_zero_mean_update=False))
+    np.testing.assert_array_equal(np.asarray(off), np.asarray(update))
+
+
+class RouterMatmulPrecisionTest(unittest.TestCase):
+  """router_matmul_precision reaches the gate projection's dot_general; empty follows matmul_precision."""
+
+  def _gate_dot_precisions(self, **kw):
+    cfg = pyconfig.initialize(
+        [None, get_test_config_path()],
+        run_name="router_precision_test",
+        enable_checkpointing=False,
+        model_name="deepseek3-tiny",
+        per_device_batch_size=1,
+        max_target_length=8,
+        **kw,
+    )
+    mesh = Mesh(maxtext_utils.create_device_mesh(cfg), cfg.mesh_axes)
+    with nn_partitioning.axis_rules(cfg.logical_axis_rules):
+      gate = moe.RoutedMoE(
+          config=cfg,
+          num_experts=cfg.num_experts,
+          num_experts_per_tok=cfg.num_experts_per_tok,
+          mesh=mesh,
+          kernel_init=nd_dense_init(1.0, "fan_in", "truncated_normal"),
+          kernel_axes=("embed", "mlp"),
+          intermediate_dim=cfg.mlp_dim,
+          dtype=cfg.dtype,
+          weight_dtype=cfg.weight_dtype,
+          rngs=nnx.Rngs(0),
+      ).gate
+      x = jnp.ones((1, 2, cfg.emb_dim), jnp.float32)
+      jaxpr = str(jax.make_jaxpr(lambda x: gate(x)[0])(x))
+    # dot_general prints its parameters over several lines; read precision= from each equation's own block.
+    return [seg.split("precision=")[1].split()[0] for seg in jaxpr.split("dot_general[")[1:] if "precision=" in seg]
+
+  def test_router_precision_reaches_dot_general(self):
+    self.assertIn("HIGHEST", self._gate_dot_precisions(router_matmul_precision="highest", float32_gate_logits=True)[0])
+    self.assertNotIn("HIGHEST", self._gate_dot_precisions()[0])
+
+  def test_router_precision_requires_float32_gate(self):
+    with self.assertRaises(ValueError):
+      self._gate_dot_precisions(router_matmul_precision="highest")
 
 
 if __name__ == "__main__":

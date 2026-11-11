@@ -1974,6 +1974,258 @@ def DEEPSEEK_MAXTEXT_TO_HF_PARAM_HOOK_FN(config, maxtext_config, scan_layers=Fal
   return mapping
 
 
+def _hy4_layout(config, maxtext_config, scan_layers):
+  """Hy4 layer layout: (num_dense, moe layer index lists per MaxText stack, indexer HF layers)."""
+  num_layers = config["num_hidden_layers"]
+  num_dense = sum(1 for t in config["mlp_layer_types"] if t == "dense")
+  if any(t != "dense" for t in config["mlp_layer_types"][:num_dense]):
+    raise ValueError(f"HF Hy4 dense layers must be the leading ones: {config['mlp_layer_types']}")
+  if num_dense != maxtext_config.first_num_dense_layers:
+    raise ValueError(f"HF Hy4 has {num_dense} dense layers, MaxText first_num_dense_layers is "
+                     f"{maxtext_config.first_num_dense_layers}.")
+  indexer_layers = {i for i, t in enumerate(config["indexer_types"]) if t == "full"}
+  use_indexer = getattr(maxtext_config, "use_indexer", False)
+  interval = getattr(maxtext_config, "indexer_share_interval", 1)
+  index_cache = use_indexer and interval > 1
+  if use_indexer:
+    if not scan_layers:
+      raise NotImplementedError("Hy4 conversion with use_indexer=True needs scan_layers=True (IndexCache blocks).")
+    if not index_cache and len(indexer_layers) != num_layers:
+      raise ValueError("HF Hy4 shares indexers across layers (indexer_types); set indexer_share_interval to match.")
+  return num_layers, num_dense, indexer_layers, use_indexer, interval, index_cache
+
+
+def HY4_MAXTEXT_TO_HF_PARAM_MAPPING(config, maxtext_config, scan_layers=False):
+  """MaxText -> HF safetensors names for Hy4 (tencent/Hy4-preview).
+
+  The HF names are the ones stored in the safetensors files (transformers renames some of them on load, e.g.
+  hc_attn_layer.hc_pre.hc_fn -> attn_hc.fn), so use the safetensors loaders. Hyper-connection fn / base / scale
+  tensors each hold the pre and post halves, which map to two MaxText parameters. Routed experts are stored fused
+  per layer (experts.gate_up_proj [E, 2I, D], experts.down_proj [E, D, I]). With IndexCache
+  (use_indexer, indexer_share_interval > 1) the MoE layers are scanned blocks of `interval` layers plus a remainder,
+  and only HF "full" indexer layers carry indexer weights. MTP layers (model.mtp_layers.*) carry no
+  hyper-connection weights and run their own indexer; they are mapped when maxtext_config.mtp_num_layers > 0.
+  """
+  num_layers, num_dense, indexer_layers, use_indexer, interval, index_cache = _hy4_layout(
+      config, maxtext_config, scan_layers
+  )
+  attention_keys = {
+      "pre_self_attention_layer_norm-scale": "input_layernorm.weight",
+      "post_self_attention_layer_norm-scale": "post_attention_layernorm.weight",
+      "self_attention-q_norm-scale": "self_attn.q_a_layernorm.weight",
+      "self_attention-wq_a-kernel": "self_attn.q_a_proj.weight",
+      "self_attention-wq_b-kernel": "self_attn.q_b_proj.weight",
+      "self_attention-wkv_a-kernel": "self_attn.kv_a_proj_with_mqa.weight",
+      "self_attention-kv_norm-scale": "self_attn.kv_a_layernorm.weight",
+      "self_attention-wkv_b-kernel": "self_attn.kv_b_proj.weight",
+      "self_attention-out-kernel": "self_attn.o_proj.weight",
+      "self_attention-gate_proj-kernel": "self_attn.linear_gate.weight",
+      "self_attention-sinks": "self_attn.learnable_sink_param",
+  }
+  for hc, mhc in (("hc_attn_layer", "mhc_attention"), ("hc_mlp_layer", "mhc_mlp")):
+    for part, mt_parts in (("hc_fn", ("pre_alpha", "post_alpha")), ("hc_base", ("pre_beta", "post_beta")),
+                           ("hc_scale", ("pre_alpha_scale", "post_alpha_scale"))):
+      for mt in mt_parts:
+        attention_keys[f"{mhc}-{mt}"] = f"{hc}.hc_pre.{part}"
+  indexer_keys = {
+      "self_attention-indexer-k_norm-bias": "self_attn.indexer.k_norm.bias",
+      "self_attention-indexer-k_norm-scale": "self_attn.indexer.k_norm.weight",
+      "self_attention-indexer-weights_proj-kernel": "self_attn.indexer.weights_proj.weight",
+      "self_attention-indexer-wk-kernel": "self_attn.indexer.wk.weight",
+      "self_attention-indexer-wq_b-kernel": "self_attn.indexer.wq_b.weight",
+  }
+  dense_keys = {
+      "mlp-wi_0-kernel": "mlp.gate_proj.weight",
+      "mlp-wi_1-kernel": "mlp.up_proj.weight",
+      "mlp-wo-kernel": "mlp.down_proj.weight",
+  }
+  moe_keys = {
+      "DeepSeekMoeBlock_0-shared_experts-wi_0-kernel": "mlp.shared_experts.gate_proj.weight",
+      "DeepSeekMoeBlock_0-shared_experts-wi_1-kernel": "mlp.shared_experts.up_proj.weight",
+      "DeepSeekMoeBlock_0-shared_experts-wo-kernel": "mlp.shared_experts.down_proj.weight",
+      "DeepSeekMoeBlock_0-MoeBlock_0-gate-kernel": "mlp.gate.weight",
+      "DeepSeekMoeBlock_0-MoeBlock_0-wi_0": "mlp.experts.gate_up_proj",
+      "DeepSeekMoeBlock_0-MoeBlock_0-wi_1": "mlp.experts.gate_up_proj",
+      "DeepSeekMoeBlock_0-MoeBlock_0-wo": "mlp.experts.down_proj",
+  }
+  moe_bias_key = ("DeepSeekMoeBlock_0-MoeBlock_0-gate-bias", "mlp.gate.e_score_correction_bias")
+
+  mapping = {
+      "params-token_embedder-embedding": "model.embed_tokens.weight",
+      "params-decoder-decoder_norm-scale": "model.norm.weight",
+      "params-decoder-logits_dense-kernel": "lm_head.weight",
+      "params-decoder-hc_head-hc_fn": "model.hc_head.hc_head_fn",
+      "params-decoder-hc_head-hc_base": "model.hc_head.hc_head_base",
+      "params-decoder-hc_head-hc_scale": "model.hc_head.hc_head_scale",
+  }
+
+  mtp_num_layers = maxtext_config.mtp_num_layers
+  if mtp_num_layers > config.get("num_nextn_predict_layers", 0):
+    raise ValueError(f"mtp_num_layers={mtp_num_layers} exceeds the checkpoint's num_nextn_predict_layers.")
+  mtp_layer_keys = {k: v for k, v in (attention_keys | moe_keys).items() if not k.startswith("mhc_")}
+  if use_indexer:
+    mtp_layer_keys |= indexer_keys
+  for j in range(mtp_num_layers):
+    mt, hf_mtp = f"mtp_block-mtp_layer_{j + 1}-mtp_{j + 1}_", f"model.mtp_layers.{j}."
+    mapping[f"params-{mt}embedding_norm-scale"] = hf_mtp + "enorm.weight"
+    mapping[f"params-{mt}hidden_state_norm-scale"] = hf_mtp + "hnorm.weight"
+    mapping[f"params-{mt}projection-kernel"] = hf_mtp + "eh_proj.weight"
+    mapping[f"params-{mt}final_norm-scale"] = hf_mtp + "final_layernorm.weight"
+    for mt_key, hf_key in mtp_layer_keys.items():
+      mapping[f"params-{mt}transformer_layer-{mt_key}"] = hf_mtp + hf_key
+    mapping[f"MoEBiasVar-{mt}transformer_layer-{moe_bias_key[0]}"] = hf_mtp + moe_bias_key[1]
+
+  def add(stack, layers, mlp_keys, with_indexer, bias_stack=None):
+    """Maps one MaxText layer stack (scanned over `layers`, or one unscanned layer if `layers` is an int)."""
+
+    def hf(key):
+      if isinstance(layers, list):
+        return [f"model.layers.{i}.{key}" for i in layers]
+      return f"model.layers.{layers}.{key}"
+
+    keys = attention_keys | mlp_keys | (indexer_keys if with_indexer else {})
+    for mt_key, hf_key in keys.items():
+      mapping[f"params-decoder-{stack}-{mt_key}"] = hf(hf_key)
+    if bias_stack is not None:
+      mapping[f"MoEBiasVar-decoder-{bias_stack}-{moe_bias_key[0]}"] = hf(moe_bias_key[1])
+
+  moe_layers = list(range(num_dense, num_layers))
+  if not scan_layers:
+    # _hy4_layout rejects use_indexer without scan_layers, so unscanned layers carry no indexer.
+    for i in range(num_dense):
+      add(f"dense_layers_{i}", i, dense_keys, False)
+    for k, i in enumerate(moe_layers):
+      add(f"moe_layers_{k}", i, moe_keys, False, bias_stack=f"moe_layers_{k}")
+    return mapping
+  add("dense_layers", list(range(num_dense)), dense_keys, use_indexer)
+  if not index_cache:
+    add("moe_layers", moe_layers, moe_keys, use_indexer, bias_stack="moe_layers")
+    return mapping
+  num_blocks = len(moe_layers) // interval
+  if num_blocks == 0:
+    raise NotImplementedError(f"Hy4 IndexCache conversion needs at least {interval} MoE layers (one full group).")
+  for j in range(interval):
+    block_layers = [moe_layers[b * interval + j] for b in range(num_blocks)]
+    full = [i in indexer_layers for i in block_layers]
+    # The first layer of every group runs the indexer; the others reuse its top-k and have no indexer weights.
+    if not (all(full) if j == 0 else not any(full)):
+      raise ValueError(f"HF indexer_types do not follow groups of {interval} MoE layers: {block_layers}")
+    add(f"moe_layers-layers_{j}", block_layers, moe_keys, j == 0, bias_stack=f"moe_layers-layers_{j}")
+  for j, i in enumerate(moe_layers[num_blocks * interval :]):
+    if (j == 0) != (i in indexer_layers):
+      raise ValueError(f"HF indexer_types do not match the IndexCache remainder at layer {i}.")
+    add(f"moe_layers_remainder-layers_{j}", i, moe_keys, j == 0, bias_stack=f"moe_layers_remainder-layers_{j}")
+  if any(i not in indexer_layers for i in range(num_dense)):
+    raise ValueError("HF Hy4 dense layers are expected to run their own indexer.")
+  return mapping
+
+
+def HY4_MAXTEXT_TO_HF_PARAM_HOOK_FN(config, maxtext_config, scan_layers=False, saving_to_hf=False):
+  """Tensor transforms for Hy4 HF -> MaxText (MaxText -> HF is not implemented).
+
+  With maxtext_config.checkpoint_rope_interleave, the last qk_rope_head_dim entries of the MLA wq_b / wkv_a
+  outputs and of the indexer wq_b / wk outputs and k_norm scale / bias (Hy4: [nope, rope] per head) go from
+  interleaved pairs (2i, 2i+1) to [even, odd], so concatenated RoPE on the converted weights equals interleaved
+  RoPE on the checkpoint. A MaxText -> HF direction would need the inverse permutation.
+  """
+  if saving_to_hf:
+    raise NotImplementedError("Hy4 MaxText -> HF conversion is not implemented.")
+  n = config["hc_mult"]
+  rope = config["qk_rope_head_dim"]
+  deinterleave = getattr(maxtext_config, "checkpoint_rope_interleave", False)
+
+  def kernel(x, target_shape):
+    return x.T.reshape(target_shape)
+
+  def rows(lo, hi, transpose):
+    def fn(x, target_shape):
+      x = x[lo:hi]
+      return (x.T if transpose else x).reshape(target_shape)
+
+    return fn
+
+  def experts_in(half):
+    def fn(x, target_shape):  # [E, 2I, D] -> [E, D, I]
+      inter = target_shape[-1]
+      return np.transpose(x[:, half * inter : (half + 1) * inter, :], (0, 2, 1))
+
+    return fn
+
+  def experts_out(x, target_shape):  # [E, D, I] -> [E, I, D]
+    return np.transpose(x, (0, 2, 1))
+
+  def rope_last(fn):
+    """Applies fn, then de-interleaves the last `rope` entries of the last axis (2i, 2i+1) -> [even, odd].
+
+    An index permutation (no in-place writes, no host copy), so it also works on the sharded JAX arrays the
+    dynamic safetensors loader passes in.
+    """
+
+    def wrapped(x, target_shape):
+      if fn is not None:
+        x = fn(x, target_shape)
+      d = x.shape[-1]
+      perm = np.concatenate([np.arange(d - rope), d - rope + np.arange(0, rope, 2), d - rope + np.arange(1, rope, 2)])
+      return x[..., perm]
+
+    return wrapped
+
+  per_layer = {
+      "self_attention-wq_a-kernel": kernel,
+      "self_attention-wq_b-kernel": kernel,
+      "self_attention-wkv_a-kernel": kernel,
+      "self_attention-wkv_b-kernel": kernel,
+      "self_attention-out-kernel": kernel,
+      "self_attention-gate_proj-kernel": kernel,
+      "self_attention-indexer-weights_proj-kernel": kernel,
+      "self_attention-indexer-wk-kernel": kernel,
+      "self_attention-indexer-wq_b-kernel": kernel,
+      "mlp-wi_0-kernel": kernel,
+      "mlp-wi_1-kernel": kernel,
+      "mlp-wo-kernel": kernel,
+      "DeepSeekMoeBlock_0-shared_experts-wi_0-kernel": kernel,
+      "DeepSeekMoeBlock_0-shared_experts-wi_1-kernel": kernel,
+      "DeepSeekMoeBlock_0-shared_experts-wo-kernel": kernel,
+      "DeepSeekMoeBlock_0-MoeBlock_0-gate-kernel": kernel,
+      "DeepSeekMoeBlock_0-MoeBlock_0-wi_0": experts_in(0),
+      "DeepSeekMoeBlock_0-MoeBlock_0-wi_1": experts_in(1),
+      "DeepSeekMoeBlock_0-MoeBlock_0-wo": experts_out,
+  }
+  if deinterleave:
+    for key in (
+        "self_attention-wq_b-kernel",
+        "self_attention-wkv_a-kernel",
+        "self_attention-indexer-wq_b-kernel",
+        "self_attention-indexer-wk-kernel",
+    ):
+      per_layer[key] = rope_last(per_layer[key])
+    per_layer["self_attention-indexer-k_norm-scale"] = rope_last(None)
+    per_layer["self_attention-indexer-k_norm-bias"] = rope_last(None)
+  for mhc in ("mhc_attention", "mhc_mlp"):
+    per_layer[f"{mhc}-pre_alpha"] = rows(0, n, True)
+    per_layer[f"{mhc}-post_alpha"] = rows(n, None, True)
+    per_layer[f"{mhc}-pre_beta"] = rows(0, n, False)
+    per_layer[f"{mhc}-post_beta"] = rows(n, None, False)
+    per_layer[f"{mhc}-pre_alpha_scale"] = rows(0, 1, False)
+    per_layer[f"{mhc}-post_alpha_scale"] = rows(1, None, False)
+
+  mapping = {
+      "params-decoder-logits_dense-kernel": kernel,
+      "params-decoder-hc_head-hc_fn": kernel,
+  }
+  for mt_key in HY4_MAXTEXT_TO_HF_PARAM_MAPPING(config, maxtext_config, scan_layers):
+    if mt_key.startswith("params-mtp_block-") and mt_key.endswith("_projection-kernel"):
+      mapping[mt_key] = kernel  # eh_proj [D, 2D] over concat(enorm(embedding), hnorm(hidden))
+      continue
+    if not mt_key.startswith(("params-decoder-", "params-mtp_block-")) or mt_key in mapping:
+      continue
+    for key, fn in per_layer.items():
+      if mt_key.endswith("-" + key):
+        mapping[mt_key] = fn
+        break
+  return mapping
+
+
 def DEEPSEEK_NNX_TO_VLLM_PARAM_HOOK_FN():
   """Creates parameter transformation functions for Deepseek."""
   return {}
@@ -4458,6 +4710,10 @@ PARAM_MAPPING = {
     "deepseek3-671b": DEEPSEEK_MAXTEXT_TO_HF_PARAM_MAPPING,
     "deepseek3.2-671b": DEEPSEEK_MAXTEXT_TO_HF_PARAM_MAPPING,
     "deepseek4-284b": DEEPSEEK_V4_MAXTEXT_TO_HF_PARAM_MAPPING,
+    "hy4-preview": HY4_MAXTEXT_TO_HF_PARAM_MAPPING,
+    "hy4-tiny": HY4_MAXTEXT_TO_HF_PARAM_MAPPING,
+    "hy4-mini": HY4_MAXTEXT_TO_HF_PARAM_MAPPING,
+    "hy4-mid": HY4_MAXTEXT_TO_HF_PARAM_MAPPING,
     "gpt-oss-20b": GPT_OSS_MAXTEXT_TO_HF_PARAM_MAPPING,
     "gpt-oss-120b": GPT_OSS_MAXTEXT_TO_HF_PARAM_MAPPING,
     "qwen3-omni-30b-a3b": QWEN3_OMNI_MOE_MAXTEXT_TO_HF_PARAM_MAPPING,
@@ -4518,6 +4774,10 @@ HOOK_FNS = {
     "deepseek3.2-671b": DEEPSEEK_MAXTEXT_TO_HF_PARAM_HOOK_FN,
     "deepseek4-tiny": DEEPSEEK_V4_MAXTEXT_TO_HF_PARAM_HOOK_FN,
     "deepseek4-284b": DEEPSEEK_V4_MAXTEXT_TO_HF_PARAM_HOOK_FN,
+    "hy4-preview": HY4_MAXTEXT_TO_HF_PARAM_HOOK_FN,
+    "hy4-tiny": HY4_MAXTEXT_TO_HF_PARAM_HOOK_FN,
+    "hy4-mini": HY4_MAXTEXT_TO_HF_PARAM_HOOK_FN,
+    "hy4-mid": HY4_MAXTEXT_TO_HF_PARAM_HOOK_FN,
     "gpt-oss-20b": GPT_OSS_TO_HF_PARAM_HOOK_FN,
     "gpt-oss-120b": GPT_OSS_TO_HF_PARAM_HOOK_FN,
     "qwen3-omni-30b-a3b": QWEN3_OMNI_MOE_MAXTEXT_TO_HF_PARAM_HOOK_FN,

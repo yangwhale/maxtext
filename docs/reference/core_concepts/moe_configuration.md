@@ -108,6 +108,8 @@ MaxText implements an exact, paper-aligned version of DeepSeek V4's load balanci
 
 `use_gmm_v2_heuristic_tiling`: If enabled, use the heuristic tiling from Tokamax GMM v2. Recommended when not using custom tuned tile sizes.
 
+`gmm_v2_native_transpose_rhs`: If enabled (with `use_gmm_v2`), the backward input gradient reads the weight transposed inside the GMM v2 kernel instead of first copying a transposed weight in HBM. Applies only where the kernel supports it: unquantized weights of the gradient dtype (>= 8 bits), no bias or fused activation; other cases keep the copy. The `*_tile_dlhs_*` tiles must then have tile_k (the weight's minor dim) a multiple of 128 and tile_n a multiple of the sublane tiling (16 for bfloat16).
+
 `megablox`: If enabled, use Megablox for sparse matrix operations. Effective only when `use_tokamax_gmm` is False.
 
 `capacity_factor`: A scalar multiplier for expert capacity. Effective only when `sparse_matmul` is False.

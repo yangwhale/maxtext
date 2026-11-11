@@ -25,10 +25,13 @@ import jax.numpy as jnp
 from jax.sharding import Mesh
 from maxtext.common.common_types import Array, Config
 from maxtext.common.common_types import HyperConnectionType
+from maxtext.kernels import ihc as ihc_kernel
 from maxtext.kernels.mhc import api as mhc_kernel
 from maxtext.layers import nnx_wrappers
+from maxtext.utils import accurate_math
 from maxtext.layers.initializers import default_bias_init, default_scalar_init, nd_dense_init, variable_to_logically_partitioned
 from maxtext.layers.normalizations import RMSNorm
+from maxtext.utils.sharding import get_logical_axis_rules, logical_to_mesh_axes
 
 
 @functools.lru_cache(maxsize=None)
@@ -41,6 +44,22 @@ def get_permutation_matrices(k: int) -> Array:
   perms = list(itertools.permutations(range(k)))
   perms_array = jnp.array(perms)
   return jnp.eye(k)[perms_array]
+
+
+def streams_flat(config) -> bool:
+  """Whether the decoder carries hyper-connection streams flat, (batch, seq, k * emb), instead of 4D (batch, seq, k, emb).
+
+  Only with the iHC Pallas kernel (its per-device view is (tokens, k * emb), so a flat carry makes that view a free
+  reshape; a 4D carry is tiled over (k, emb) on TPU and copied into and out of the view at every layer). Layers that
+  read the stream's trailing axes keep the 4D carry: engram (normalizes and unpacks the 4D stream) and an active
+  dropout (broadcast over the stream axis, -2, which on a flat carry would be the sequence axis).
+  """
+  return (
+      getattr(config, "mhc_expansion_rate", 1) > 1
+      and getattr(config, "use_ihc_pallas_kernel", False)
+      and not getattr(config, "engram_layers", None)
+      and not (getattr(config, "enable_dropout", False) and getattr(config, "dropout_rate", 0.0) > 0.0)
+  )
 
 
 def get_functions(expansion_rate: int):
@@ -327,7 +346,10 @@ class ManifoldConstrainedHyperConnections(nnx.Module):
     # 4. Attention or MLP
     metadata = {}
     if mhc_type == HyperConnectionType.ATTENTION:
-      layer_out, _ = branch_fn(inputs_q=layer_input, inputs_kv=layer_input, **kwargs)
+      attention_outputs = branch_fn(inputs_q=layer_input, inputs_kv=layer_input, **kwargs)
+      layer_out = attention_outputs[0]
+      if len(attention_outputs) > 2:  # (out, kv_cache, indexer_mask) when the caller asked for the DSA mask
+        metadata["indexer_mask"] = attention_outputs[2]
     elif mhc_type == HyperConnectionType.MLP_DENSE:
       layer_out = branch_fn(inputs=layer_input, **kwargs)
     elif mhc_type == HyperConnectionType.MLP_MOE:
@@ -377,6 +399,207 @@ class ManifoldConstrainedHyperConnections(nnx.Module):
     return res_out + post_out, metadata
 
 
+class IdentityHyperConnections(nnx.Module):
+  """Identity hyper-connections (iHC), the Hy4 variant of hyper-connections.
+
+  Compared to mHC there is no residual mixing matrix (the residual of every stream is the identity,
+  i.e. the sinkhorn part is dropped), the input RMS norm carries no learned scale, the post gate is
+  `hc_post_magnitude * sigmoid(.) + hc_eps`, and gates plus the weighted stream sum are computed in
+  float32. Per token, with the k streams flattened into `flat` of size k * dim:
+
+    mixes = (flat @ [pre_alpha, post_alpha]) * rsqrt(mean(flat**2) + eps)
+    pre   = sigmoid(pre_alpha_scale * mixes[:k] + pre_beta) + hc_eps
+    post  = hc_post_magnitude * sigmoid(post_alpha_scale * mixes[k:] + post_beta) + hc_eps
+    out_n = x_n + post_n * branch(norm(sum_n pre_n * x_n))
+
+  Same call interface as `ManifoldConstrainedHyperConnections`.
+  """
+
+  def __init__(
+      self,
+      config: Config,
+      dim: int,
+      mesh: Mesh,
+      rngs: nnx.Rngs,
+  ):
+    self.config = config
+    self.k = config.mhc_expansion_rate
+    self.dim = dim
+    self.mesh = mesh
+    self.rngs = rngs
+    self.dtype = config.dtype
+    self.weight_dtype = config.weight_dtype
+    self.eps = config.normalization_layer_epsilon
+    self.hc_eps = config.hc_eps
+    self.post_magnitude = config.hc_post_magnitude
+    self.precision = jax.lax.Precision(config.hc_matmul_precision or "highest")
+
+    weight_init = nnx.initializers.normal(stddev=config.hc_init_std)
+    weight_sharding = ("activation_embed", None)
+    self.pre_alpha = nnx.Param(
+        weight_init(rngs.params(), (self.k * dim, self.k), self.weight_dtype), out_sharding=weight_sharding
+    )
+    self.post_alpha = nnx.Param(
+        weight_init(rngs.params(), (self.k * dim, self.k), self.weight_dtype), out_sharding=weight_sharding
+    )
+    # pre_beta starts at -log(k - 1) so that the initial pre gates sum to ~1 over the k streams.
+    pre_beta_init = -math.log(self.k - 1) if self.k > 1 else 0.0
+    self.pre_beta = nnx.Param(jnp.full((self.k,), pre_beta_init, self.weight_dtype), out_sharding=(None,))
+    self.post_beta = nnx.Param(jnp.zeros((self.k,), self.weight_dtype), out_sharding=(None,))
+    self.pre_alpha_scale = nnx.Param(jnp.full((1,), 0.01, self.weight_dtype), out_sharding=(None,))
+    self.post_alpha_scale = nnx.Param(jnp.full((1,), 0.01, self.weight_dtype), out_sharding=(None,))
+
+  def _gate_params(self):
+    """float32 gate parameters: alpha = [pre_alpha, post_alpha] (k*dim, 2k), then pre / post scale and beta."""
+    alpha = jnp.concatenate(
+        [jnp.asarray(self.pre_alpha[...], jnp.float32), jnp.asarray(self.post_alpha[...], jnp.float32)], axis=-1
+    )
+    pre_scale = jnp.asarray(self.pre_alpha_scale[...], jnp.float32)
+    post_scale = jnp.asarray(self.post_alpha_scale[...], jnp.float32)
+    pre_beta = jnp.asarray(self.pre_beta[...], jnp.float32)
+    post_beta = jnp.asarray(self.post_beta[...], jnp.float32)
+    return alpha, pre_scale, post_scale, pre_beta, post_beta
+
+  def gates(self, x: Array) -> tuple[Array, Array]:
+    """Returns float32 (pre, post) gates of shape [batch, seq, k]."""
+    b, s, k, d = x.shape
+    flat = jnp.reshape(x, (b, s, k * d)).astype(jnp.float32)
+    inv_rms = jax.lax.rsqrt(jnp.mean(jnp.square(flat), axis=-1, keepdims=True) + self.eps)
+    alpha, pre_scale, post_scale, pre_beta, post_beta = self._gate_params()
+    mixes = jnp.einsum("bsm,mn->bsn", flat, alpha, precision=self.precision) * inv_rms
+    pre_logits, post_logits = mixes[..., :k], mixes[..., k:]
+    acc = accurate_math.site_on(self.config, "sigmoid_ihc")  # accurate FP32 sigmoid (accurate_math)
+    pre = accurate_math.sigmoid(pre_logits * pre_scale + pre_beta, acc) + self.hc_eps
+    post = self.post_magnitude * accurate_math.sigmoid(post_logits * post_scale + post_beta, acc) + self.hc_eps
+    return pre, post
+
+  def _kernel_config(self) -> ihc_kernel.IhcKernelConfig:
+    """Kernel config; the kernels run per device on the token shards of x (batch and sequence axes)."""
+    mesh, token_axes = None, (None, None)
+    if self.mesh is not None:
+      logical = ("activation_batch", "activation_norm_length", "activation_embed")
+      spec = logical_to_mesh_axes(logical, mesh=self.mesh, rules=get_logical_axis_rules())
+      if spec[2] is not None:
+        raise ValueError(f"use_ihc_pallas_kernel requires an unsharded embedding axis; activation_embed -> {spec[2]}.")
+      mesh, token_axes = self.mesh, (spec[0], spec[1])
+    return ihc_kernel.IhcKernelConfig(
+        rms_epsilon=self.eps,
+        hc_eps=self.hc_eps,
+        post_magnitude=self.post_magnitude,
+        block_size=self.config.ihc_pallas_block_size,
+        bwd_block_size=self.config.ihc_pallas_bwd_block_size,
+        mesh=mesh,
+        token_axes=token_axes,
+        interpret=jax.default_backend() != "tpu",
+    )
+
+  def _kernel_pre(self, kernel_config: ihc_kernel.IhcKernelConfig, x: Array):
+    """Same gates and stream sum as `gates` + the float32 stream sum below, as one Pallas kernel."""
+    k = self.k
+    alpha, pre_scale, post_scale, pre_beta, post_beta = self._gate_params()
+    scale = jnp.concatenate([jnp.broadcast_to(pre_scale, (k,)), jnp.broadcast_to(post_scale, (k,))])
+    beta = jnp.concatenate([pre_beta, post_beta])
+    return ihc_kernel.ihc_pre(kernel_config, x, alpha, scale, beta)
+
+  def _kernel_fits(self, kernel_config: ihc_kernel.IhcKernelConfig, x: Array) -> bool:
+    """Whether the per-device token count of x tiles into the kernel blocks (else the XLA path runs, e.g. decode)."""
+    b, s = x.shape[0], x.shape[1]
+    if kernel_config.mesh is not None:
+      for i, entry in enumerate(kernel_config.token_axes):
+        names = () if entry is None else (entry if isinstance(entry, tuple) else (entry,))
+        shards = math.prod(kernel_config.mesh.shape[n] for n in names)
+        if (b, s)[i] % shards:
+          return False
+        if i == 0:
+          b //= shards
+        else:
+          s //= shards
+    return ihc_kernel.tokens_supported(b * s, kernel_config)
+
+  def __call__(
+      self,
+      norm_fn: Callable,
+      branch_fn: Callable,
+      x: Array,
+      mhc_type: HyperConnectionType,
+      **kwargs,
+  ) -> Array:
+    flat = x.ndim == 3  # streams carried flat, (batch, seq, k * dim); see streams_flat
+    if flat:
+      if x.shape[-1] != self.k * self.dim:
+        raise ValueError(
+            f"Expected hyper-connection streams, (batch, seq, k * dim) = (..., {self.k * self.dim}) or 4D; got {x.shape}."
+        )
+      x = jnp.reshape(x, x.shape[:2] + (self.k, self.dim))
+    kernel_config = self._kernel_config() if self.config.use_ihc_pallas_kernel else None
+    if kernel_config is not None and self._kernel_fits(kernel_config, x):
+      layer_input, x_kernel, post = self._kernel_pre(kernel_config, x)
+      layer_out, metadata = self._branch(norm_fn, branch_fn, layer_input, mhc_type, **kwargs)
+      out = ihc_kernel.ihc_post(kernel_config, layer_out, x_kernel, post)
+    else:
+      out, metadata = self._xla_call(norm_fn, branch_fn, x, mhc_type, **kwargs)
+    return (jnp.reshape(out, out.shape[:2] + (-1,)) if flat else out), metadata
+
+  def _xla_call(self, norm_fn: Callable, branch_fn: Callable, x: Array, mhc_type: HyperConnectionType, **kwargs):
+    """XLA path on 4D streams x (batch, seq, k, dim)."""
+    pre, post = self.gates(x)
+    xf = x.astype(jnp.float32)
+    # Weighted stream sum, kept in float32. The plain form, jnp.sum(pre[..., None] * xf, axis=2), fails to compile with
+    # the tpu_pre_training 0.2.5 image (jax 0.11.1, libtpu 0.0.46) on TPU v7x: the multiply-reduce fusion over
+    # [batch, seq, k, emb] in the rematted backward hits "Cannot find a valid window for %multiply_reduce_fusion".
+    # Two forms avoid it:
+    #   - default: a contraction over k (einsum at HIGHEST, a multi-pass bfloat16 approximation of float32 on TPU);
+    #   - ihc_stream_sum_unrolled: k explicit float32 multiply-adds (elementwise; fuses with the surrounding casts).
+    #     Its backward still reduces over emb once per stream; it compiled and trained on a 64-chip v7x Hy4 run with
+    #     remat (41 layers).
+    # TODO: go back to jnp.sum (and drop ihc_stream_sum_unrolled) once the libtpu in use compiles it; re-test on v7x.
+    if self.config.ihc_stream_sum_unrolled:
+      layer_input = pre[..., 0:1] * xf[:, :, 0]
+      for i in range(1, x.shape[2]):
+        layer_input = layer_input + pre[..., i : i + 1] * xf[:, :, i]
+      layer_input = self._round(layer_input).astype(x.dtype)
+    else:
+      layer_input = self._round(jnp.einsum("bsk,bskd->bsd", pre, xf, precision=jax.lax.Precision.HIGHEST)).astype(x.dtype)
+    layer_out, metadata = self._branch(norm_fn, branch_fn, layer_input, mhc_type, **kwargs)
+    out = xf + post[..., None] * jnp.expand_dims(layer_out.astype(jnp.float32), axis=2)
+    return self._round(out).astype(x.dtype), metadata
+
+  def _round(self, v: Array) -> Array:
+    """ihc_force_bf16_rounding: round to `dtype` with reduce_precision, which XLA never removes (a plain
+    float32 -> dtype -> float32 round trip may be elided under excess precision)."""
+    if not getattr(self.config, "ihc_force_bf16_rounding", False) or jnp.dtype(self.dtype) == jnp.float32:
+      return v
+    fi = jnp.finfo(self.dtype)
+    return jax.lax.reduce_precision(v, fi.nexp, fi.nmant)
+
+  def _branch(self, norm_fn: Callable, branch_fn: Callable, layer_input: Array, mhc_type: HyperConnectionType, **kwargs):
+    """Pre-norm and the wrapped branch; returns (layer_out, metadata)."""
+    layer_input = norm_fn(layer_input)
+
+    metadata = {}
+    if mhc_type == HyperConnectionType.ATTENTION:
+      attention_outputs = branch_fn(inputs_q=layer_input, inputs_kv=layer_input, **kwargs)
+      layer_out = attention_outputs[0]
+      if len(attention_outputs) > 2:  # (out, kv_cache, indexer_mask) when the caller asked for the DSA mask
+        metadata["indexer_mask"] = attention_outputs[2]
+    elif mhc_type == HyperConnectionType.MLP_DENSE:
+      layer_out = branch_fn(inputs=layer_input, **kwargs)
+    elif mhc_type == HyperConnectionType.MLP_MOE:
+      layer_out, load_balance_loss, moe_bias_updates = branch_fn(inputs=layer_input, **kwargs)
+      metadata["load_balance_loss"] = load_balance_loss
+      metadata["moe_bias_updates"] = moe_bias_updates
+    else:
+      raise ValueError(f"Unsupported type: {mhc_type}")
+    return layer_out, metadata
+
+
+def make_hyper_connections(config: Config, dim: int, mesh: Mesh, rngs: nnx.Rngs):
+  """Builds the hyper-connection module selected by `config.hc_variant`."""
+  if config.hc_variant == "ihc":
+    return IdentityHyperConnections(config, dim, mesh, rngs)
+  return ManifoldConstrainedHyperConnections(config, dim, mesh, rngs)
+
+
 class DeepSeek4HyperHead(nnx.Module):
   """Final HC-stream collapse; used by DeepSeek V4 before the shared RMSNorm."""
 
@@ -393,7 +616,10 @@ class DeepSeek4HyperHead(nnx.Module):
     self.weight_dtype = config.weight_dtype
     self.mhc_expansion_rate = config.mhc_expansion_rate
     self.emb_dim = config.emb_dim
-    self.eps = 1e-6
+    # DeepSeek-V4 uses 1e-6 for both (the config defaults); Hy4 sets hc_head_norm_epsilon to its rms_norm_eps.
+    self.norm_eps = config.hc_head_norm_epsilon
+    self.eps = config.hc_eps
+    self.precision = jax.lax.Precision(config.hc_matmul_precision or config.matmul_precision)
 
     # Weight matrices
     weight_init = nd_dense_init(1.0, "fan_in", "normal")
@@ -408,7 +634,8 @@ class DeepSeek4HyperHead(nnx.Module):
         out_sharding=("activation_embed", None),
     )
     self.hc_base = nnx.Param(
-        default_bias_init(rngs.params(), (self.mhc_expansion_rate,), self.weight_dtype),
+        default_bias_init(rngs.params(), (self.mhc_expansion_rate,), self.weight_dtype)
+        + jnp.asarray(config.hc_head_base_init, self.weight_dtype),
         out_sharding=(None,),
     )
     self.hc_scale = nnx.Param(
@@ -425,14 +652,15 @@ class DeepSeek4HyperHead(nnx.Module):
     flat = jnp.reshape(x, (b, s, k * d))
     flat_f32 = flat.astype(jnp.float32)
     variance = jnp.mean(jnp.square(flat_f32), axis=-1, keepdims=True)
-    flat_norm = flat_f32 * jax.lax.rsqrt(variance + self.eps)
+    flat_norm = flat_f32 * jax.lax.rsqrt(variance + self.norm_eps)
 
     hc_fn = jnp.asarray(self.hc_fn[...], jnp.float32)
     hc_base = jnp.asarray(self.hc_base[...], jnp.float32)
     hc_scale = jnp.asarray(self.hc_scale[...], jnp.float32)
 
-    mixes = jnp.einsum("bsm,mk->bsk", flat_norm, hc_fn, precision=jax.lax.Precision(self.config.matmul_precision))
-    pre = jax.nn.sigmoid(mixes * hc_scale[None, None, :] + hc_base[None, None, :]) + self.eps
+    mixes = jnp.einsum("bsm,mk->bsk", flat_norm, hc_fn, precision=self.precision)
+    acc = accurate_math.site_on(self.config, "sigmoid_hc_head")
+    pre = accurate_math.sigmoid(mixes * hc_scale[None, None, :] + hc_base[None, None, :], acc) + self.eps
 
     x_f32 = x.astype(jnp.float32)
     out = jnp.sum(pre[:, :, :, None] * x_f32, axis=2)

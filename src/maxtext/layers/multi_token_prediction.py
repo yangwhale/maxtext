@@ -13,8 +13,10 @@
 # limitations under the License.
 
 """JAX implementation of the Multi Token Prediction https://arxiv.org/pdf/2412.19437"""
+
 # pylint: disable=no-name-in-module
 
+import inspect
 from typing import Type
 
 from flax import nnx
@@ -23,6 +25,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh
 from maxtext.common.common_types import Config, DecoderBlockType, MODEL_MODE_TRAIN, ShardMode
 from maxtext.layers import moe
+from maxtext.utils import accurate_math
 from maxtext.layers.linears import DenseGeneral
 from maxtext.layers.nnx_decoders import NNXDecoderLayer
 from maxtext.layers.normalizations import RMSNorm
@@ -192,6 +195,9 @@ class MultiTokenPredictionLayer(nnx.Module):
         dtype=cfg.dtype,
         weight_dtype=cfg.weight_dtype,
         kernel_axes=("norm",),
+        single_rounding=getattr(cfg, "rmsnorm_single_rounding", False),
+        scale_grad_fp32=getattr(cfg, "rmsnorm_scale_grad_fp32", False),
+        scale_grad_gpu_order=getattr(cfg, "rmsnorm_scale_grad_gpu_order", False),
         rngs=rngs,
     )
     self.hidden_state_norm = RMSNorm(
@@ -200,6 +206,9 @@ class MultiTokenPredictionLayer(nnx.Module):
         dtype=cfg.dtype,
         weight_dtype=cfg.weight_dtype,
         kernel_axes=("norm",),
+        single_rounding=getattr(cfg, "rmsnorm_single_rounding", False),
+        scale_grad_fp32=getattr(cfg, "rmsnorm_scale_grad_fp32", False),
+        scale_grad_gpu_order=getattr(cfg, "rmsnorm_scale_grad_gpu_order", False),
         rngs=rngs,
     )
     self.projection_layer = DenseGeneral(
@@ -209,14 +218,27 @@ class MultiTokenPredictionLayer(nnx.Module):
         weight_dtype=cfg.weight_dtype,
         use_bias=False,
         kernel_axes=("embed", None),
+        fp32_accumulation=getattr(cfg, "dense_fp32_accumulation", False),
         rngs=rngs,
     )
     # Use MODEL_MODE_TRAIN for initialization; runtime model_mode is passed dynamically.
+    # The generic MTP layer runs on the collapsed 3D hidden state, so in an mHC model its transformer layer is
+    # built without hyper-connections (those expect [batch, seq, mhc_expansion_rate, emb] and fail on 3D).
+    layer_kwargs = {}
+    if cfg.mhc_expansion_rate > 1:
+      # nnx.Module's metaclass hides the constructor signature on the class itself, so inspect __init__.
+      if "use_hyper_connections" not in inspect.signature(transformer_layer_module.__init__).parameters:
+        raise ValueError(
+            f"MTP on an mHC model needs a layer that can be built without hyper-connections; "
+            f"{transformer_layer_module.__name__} has no use_hyper_connections argument."
+        )
+      layer_kwargs["use_hyper_connections"] = False
     self.transformer_layer = transformer_layer_module(
         config=cfg,
         mesh=mesh,
         model_mode=MODEL_MODE_TRAIN,
         rngs=rngs,
+        **layer_kwargs,
     )
 
     self.final_norm = RMSNorm(
@@ -225,6 +247,9 @@ class MultiTokenPredictionLayer(nnx.Module):
         dtype=cfg.dtype,
         weight_dtype=cfg.weight_dtype,
         kernel_axes=("norm",),
+        single_rounding=getattr(cfg, "rmsnorm_single_rounding", False),
+        scale_grad_fp32=getattr(cfg, "rmsnorm_scale_grad_fp32", False),
+        scale_grad_gpu_order=getattr(cfg, "rmsnorm_scale_grad_gpu_order", False),
         rngs=rngs,
     )
 
@@ -277,6 +302,8 @@ class MultiTokenPredictionLayer(nnx.Module):
       decoder_segment_ids: None | jnp.ndarray,
       deterministic: bool,
       model_mode: str = MODEL_MODE_TRAIN,
+      forced_routed_experts: None | jnp.ndarray = None,
+      forced_indexer_topk: None | jnp.ndarray = None,
   ) -> jnp.ndarray:
     """Applies MTP combination, projection, and transformer processing.
 
@@ -352,18 +379,23 @@ class MultiTokenPredictionLayer(nnx.Module):
           cfg=self.config,
       )
     else:
+      # Router replay (debug_forced_routing_deepseek), [batch, seq, top_k]; not passed otherwise.
+      replay = {} if forced_routed_experts is None else {"forced_routed_experts": forced_routed_experts}
+      if forced_indexer_topk is not None:  # debug_forced_indexer_topk, [batch, seq, indexer_topk]
+        replay["forced_indexer_topk"] = forced_indexer_topk
       output = self.transformer_layer(
           inputs=projected_features,
           decoder_segment_ids=decoder_segment_ids,
           decoder_positions=position_ids,
           deterministic=deterministic,
           model_mode=model_mode,
+          **replay,
       )
 
     return output[0] if isinstance(output, tuple) else output
 
 
-def _cross_entropy_with_integer_labels(logits: jnp.ndarray, labels: jnp.ndarray) -> jnp.ndarray:
+def _cross_entropy_with_integer_labels(logits: jnp.ndarray, labels: jnp.ndarray, accurate=False) -> jnp.ndarray:
   """Memory-efficient cross entropy loss from integer target labels.
 
   Avoids materializing a dense 3D [batch, seq_len, vocab_size] one-hot target
@@ -376,7 +408,11 @@ def _cross_entropy_with_integer_labels(logits: jnp.ndarray, labels: jnp.ndarray)
   Returns:
     Cross-entropy loss tensor of shape [...].
   """
-  log_sum_exp = jax.scipy.special.logsumexp(logits, axis=-1, keepdims=True)
+  if accurate:  # transcendental_accuracy_highest: exp / log at lax accuracy=HIGHEST (same max-shifted form)
+    m = jax.lax.stop_gradient(jnp.max(logits, axis=-1, keepdims=True))
+    log_sum_exp = accurate_math.log(jnp.sum(accurate_math.exp(logits - m, True), axis=-1, keepdims=True), accurate) + m
+  else:
+    log_sum_exp = jax.scipy.special.logsumexp(logits, axis=-1, keepdims=True)
   target_logits = jnp.take_along_axis(logits, labels[..., None], axis=-1)
   return jnp.squeeze(log_sum_exp - target_logits, axis=-1)
 
@@ -465,12 +501,15 @@ class MultiTokenPredictionBlock(nnx.Module):
       model_mode,
       deterministic,
       main_token_embeddings=None,
+      forced_routed_experts=None,
+      forced_indexer_topk=None,
   ) -> dict:
     """Runs the MTP layers and sows their losses.
 
     Args:
       shared_embedding: Shared token embedding, used for the MTP input embeddings and the output head.
-      main_hidden_state: Final (pre-norm) hidden state of the main decoder.
+      main_hidden_state: Final hidden state of the main decoder, before decoder_norm unless
+        mtp_input_post_final_norm is set.
       input_ids: Main decoder input tokens.
       target_ids: Main decoder target tokens.
       target_mask: Main decoder target mask or packed segment ids.
@@ -536,6 +575,8 @@ class MultiTokenPredictionBlock(nnx.Module):
 
     mtp_losses_list = []
     mtp_weights_list = []
+    mtp_rank_scaled_list = []  # mtp_loss_mcore_per_rank: sum over rows of loss_row * orig_row / rolled_row
+    orig_row_tokens = jnp.sum(target_mask, axis=-1).astype(jnp.float32)  # [batch]: valid main-loss tokens per row
     mtp_preds_list = []
     mtp_masks_list = []
 
@@ -581,6 +622,8 @@ class MultiTokenPredictionBlock(nnx.Module):
           decoder_segment_ids=decoder_segment_ids,
           deterministic=deterministic,
           model_mode=self.decoder.model_mode,
+          **({} if forced_routed_experts is None else {"forced_routed_experts": forced_routed_experts[k - 1]}),
+          **({} if forced_indexer_topk is None else {"forced_indexer_topk": forced_indexer_topk[k - 1]}),
       )
 
       # Apply separate normalization to the MTP hidden state before projecting to logits.
@@ -610,7 +653,8 @@ class MultiTokenPredictionBlock(nnx.Module):
           debug_sharding=cfg.debug_sharding,
       )
 
-      mtp_xent = _cross_entropy_with_integer_labels(mtp_logits, rolled_target_ids)
+      acc = accurate_math.log_mode(cfg, getattr(cfg, "transcendental_accuracy_highest", False))
+      mtp_xent = _cross_entropy_with_integer_labels(mtp_logits, rolled_target_ids, accurate=acc)
       mtp_xent = sharding.maybe_shard_with_logical(
           mtp_xent,
           ("activation_embed_and_logits_batch", "activation_length"),
@@ -623,6 +667,10 @@ class MultiTokenPredictionBlock(nnx.Module):
       if model_mode == MODEL_MODE_TRAIN:
         mtp_losses_list.append(jnp.sum(mtp_xent_masked))
         mtp_weights_list.append(jnp.sum(rolled_target_mask).astype(jnp.float32))
+        if cfg.mtp_loss_mcore_per_rank:
+          row_loss = jnp.sum(mtp_xent_masked, axis=-1)
+          row_rolled = jnp.sum(rolled_target_mask, axis=-1).astype(jnp.float32)
+          mtp_rank_scaled_list.append(jnp.sum(row_loss * orig_row_tokens / jnp.maximum(row_rolled, 1.0)))
 
       if cfg.mtp_eval_target_module == k:
         # Float32 to avoid gradient errors; converted back to int32 in acceptance calculation.
@@ -633,6 +681,9 @@ class MultiTokenPredictionBlock(nnx.Module):
       # Not part of checkpoints, don't declare in __init__
       self.losses = mtp_losses(jnp.stack(mtp_losses_list))
       self.weights = mtp_losses(jnp.stack(mtp_weights_list))
+      if mtp_rank_scaled_list:
+        self.rank_scaled_losses = mtp_losses(jnp.stack(mtp_rank_scaled_list))
+        self.orig_tokens = mtp_losses(jnp.sum(orig_row_tokens))
     if mtp_preds_list:
       # Not part of checkpoints, don't declare in __init__
       self.mtp_preds = mtp_acceptance(jnp.stack(mtp_preds_list))
@@ -664,6 +715,17 @@ def calculate_mtp_loss(intermediate_outputs, config):
       return 0.0
     mtp_losses_array = mtp_losses_data
     mtp_weights_array = mtp_weights_data
+
+  if getattr(config, "mtp_loss_mcore_per_rank", False):
+    # Megatron-Core with calculate_per_token_loss (multi_token_prediction.py): each rank rescales its MTP loss sum by
+    # its own original / rolled token counts, factor / mtp_num_layers per layer, and the gradients are divided by the
+    # global token count like the main loss. One row per device per microbatch, so a rank's counts are a row's
+    # counts. Returned per main-loss token of this microbatch, so the manual-GA scaling by total_weights restores it.
+    scaled = maxtext_utils.get_nested_value(intermediate_outputs, ("mtp_losses", "mtp_block", "rank_scaled_losses"))
+    orig = maxtext_utils.get_nested_value(intermediate_outputs, ("mtp_losses", "mtp_block", "orig_tokens"))
+    if isinstance(scaled, (tuple, list)):
+      scaled, orig = jnp.array(scaled), jnp.array(orig)
+    return jnp.mean(jnp.asarray(scaled)) / (jnp.asarray(orig).reshape(()) + EPS) * config.mtp_loss_scaling_factor
 
   avg_mtp_loss = jnp.sum(mtp_losses_array) / (jnp.sum(mtp_weights_array) + EPS)
   return avg_mtp_loss * config.mtp_loss_scaling_factor

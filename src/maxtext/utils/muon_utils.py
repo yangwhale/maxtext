@@ -87,6 +87,13 @@ ATTENTION_QKV_NAMES = (
 
 ATTENTION_OUT_NAMES = ("out",)
 
+# Hyper-connection matrices (iHC / mHC): pre / post / res alpha projections of each layer and the HC head's hc_fn.
+# Excluded from Muon (they go to AdamW) when muon_exclude_ihc is on.
+HYPER_CONNECTION_NAMES = ("pre_alpha", "post_alpha", "res_alpha", "hc_fn")
+
+# Head-expanded MLA output gate (attention_output_gate="elementwise"): [emb, (num_layers), num_heads, v_head_dim].
+ATTENTION_GATE_NAMES = ("gate_proj",)
+
 MOE_BLOCK_NAMES = (
     "MoeBlock_0",
     "moe_block",
@@ -100,6 +107,8 @@ def transform_logic(
     path: Tuple[str, ...],
     shape: Optional[Tuple[int, ...]] = None,
     include_routers: bool = True,
+    exclude_hyper_connections: bool = False,
+    attention_gate_head_shape: Optional[Tuple[int, int]] = None,
 ) -> Optional[mdn]:
   """Determines Muon dimension numbers based on parameter path and shape.
 
@@ -135,6 +144,11 @@ def transform_logic(
     shape: Optional shape tuple of the parameter tensor.
     include_routers: Whether to apply Muon updates to MoE router matrices. If
       False, router weights return None and are optimized with AdamW.
+    exclude_hyper_connections: If True, hyper-connection matrices (HYPER_CONNECTION_NAMES) return None and are
+      optimized with AdamW (muon_exclude_ihc).
+    attention_gate_head_shape: (num_heads, v_head_dim) of a head-expanded attention output gate. An attention
+      `gate_proj` whose last two dims match it is orthogonalized as one [emb, num_heads * v_head_dim] matrix, like
+      the QKV projections; without it the heads axis would be a batch axis (one matrix per head).
 
   Returns:
     An instance of `optax.contrib.MuonDimensionNumbers` if a valid mapping is
@@ -152,6 +166,20 @@ def transform_logic(
       for segment in path
   ):
     return None
+
+  if exclude_hyper_connections and _is_path_contain_any(HYPER_CONNECTION_NAMES, path):
+    return None
+
+  # Head-expanded attention output gate: [emb, (num_layers), num_heads, v_head_dim] -> reduce (0,), output (-2, -1)
+  if (
+      attention_gate_head_shape is not None
+      and _is_path_contain_any(ATTENTION_GATE_NAMES, path)
+      and _is_path_contain_any(ATTENTION_BLOCK_NAMES, path)
+      and shape is not None
+      and len(shape) >= 3
+      and tuple(shape[-2:]) == tuple(attention_gate_head_shape)
+  ):
+    return mdn((0,), (-2, -1))
 
   # MoE routed expert weights: [num_experts, (num_layers), in_features, out_features]
   if _is_path_contain_any(MOE_BLOCK_NAMES, path) and not _is_path_contain_any(("shared_experts", "shared_expert"), path):
@@ -183,19 +211,39 @@ def transform_logic(
   return mdn((0,), (-1,))
 
 
-def get_transform_tree(tree, path=(), include_routers: bool = True):
+def transform_kwargs(config) -> dict:
+  """transform_logic keyword arguments read from the config (all off / None when config is None)."""
+  if config is None:
+    return {}
+  gate = None
+  if (
+      getattr(config, "muon_attention_gate_whole_matrix", False)
+      and getattr(config, "attention_type", None) == "mla"
+      and getattr(config, "attention_output_gate", None) == "elementwise"
+  ):
+    gate = (config.num_query_heads, config.v_head_dim)
+  return {
+      "include_routers": getattr(config, "muon_include_routers", True),
+      "exclude_hyper_connections": getattr(config, "muon_exclude_ihc", False),
+      "attention_gate_head_shape": gate,
+  }
+
+
+def get_transform_tree(tree, path=(), include_routers: bool = True, **kwargs):
   """Recursively extracts `MuonDimensionNumbers` for Linen abstract parameters."""
   if isinstance(tree, (dict, collections.abc.Mapping)) or hasattr(tree, "items"):
-    return {k: get_transform_tree(v, path=path + (k,), include_routers=include_routers) for k, v in tree.items()}
+    return {
+        k: get_transform_tree(v, path=path + (k,), include_routers=include_routers, **kwargs) for k, v in tree.items()
+    }
   else:
     val = getattr(tree, "value", tree)
     val_shape = getattr(val, "shape", None)
-    return transform_logic(path, shape=val_shape, include_routers=include_routers)
+    return transform_logic(path, shape=val_shape, include_routers=include_routers, **kwargs)
 
 
 def get_muon_weight_dimension_numbers(model, config=None, verbose=False):
   """Extracts a matching pytree of `MuonDimensionNumbers` from a model."""
-  include_routers = getattr(config, "muon_include_routers", True) if config is not None else True
+  kwargs = transform_kwargs(config)
   _, abstract_param, _ = nnx.split(model, nnx.Param, ...)
 
   def apply_transform_nnx(path: Tuple[jax.tree_util.KeyEntry, ...], leaf):
@@ -203,7 +251,7 @@ def get_muon_weight_dimension_numbers(model, config=None, verbose=False):
     path_strings = tuple(p.key for p in path if isinstance(p, jax.tree_util.DictKey))
     val = leaf.get_value() if hasattr(leaf, "get_value") else leaf
     val_shape = getattr(val, "shape", None)
-    return transform_logic(path_strings, shape=val_shape, include_routers=include_routers)
+    return transform_logic(path_strings, shape=val_shape, **kwargs)
 
   # tree_map_with_path handles NNX's PyTree structure; result is an nnx.State with the
   # same structure, where each Param's value holds the mdn result.

@@ -14,6 +14,7 @@
 
 """Normalization Layers."""
 
+import functools
 from typing import Any
 
 from flax import nnx
@@ -55,6 +56,48 @@ def _align_scale_with_normalized_axis(scale: jnp.ndarray, y: jnp.ndarray) -> jnp
   )
 
 
+def _scale_mul(normed, scale_r, sharding):
+  """The single_rounding path's product: exactly the op (an einsum, i.e. a dot_general) the default path uses."""
+  return jnp.einsum("...k,k->...k", normed, scale_r, out_sharding=sharding)
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(2, 3))
+def _scale_mul_dgamma_per_row(normed: jnp.ndarray, scale: jnp.ndarray, dtype, sharding) -> jnp.ndarray:
+  """normed * round_to_dtype(scale), float32 in and out, with the scale gradient summed like Megatron-Core + TE.
+
+  TE's fused RMSNorm backward sums dgamma over all tokens of its micro-batch in float32 and writes it once in the
+  parameter dtype (bf16); Megatron's DDP hook then adds it into the float32 main_grad, so micro-batches and data
+  parallel ranks are summed in float32. With micro_batch_size 1 per rank, one rank's micro-batch is one sequence.
+  Here: dgamma per batch row (= sequence; float32 sum over every other axis, across any sequence sharding),
+  rounded once to `dtype` with reduce_precision (never removed as excess precision), then summed over rows in
+  float32. The forward op and the input-gradient op are the ones autodiff produces for the default path (the
+  same einsum and its transpose), so only the scale gradient changes.
+  """
+  fi = jnp.finfo(dtype)
+  return _scale_mul(normed, lax.reduce_precision(scale, fi.nexp, fi.nmant), sharding)
+
+
+def _scale_mul_dgamma_per_row_fwd(normed, scale, dtype, sharding):
+  return _scale_mul_dgamma_per_row(normed, scale, dtype, sharding), (normed, scale)
+
+
+def _scale_mul_dgamma_per_row_bwd(dtype, sharding, res, g):
+  normed, scale = res
+  fi = jnp.finfo(dtype)
+  scale_r = lax.reduce_precision(scale, fi.nexp, fi.nmant)
+  _, vjp_normed = jax.vjp(lambda n: _scale_mul(n, scale_r, sharding), normed)
+  (d_normed,) = vjp_normed(g)
+  if normed.ndim == 1:
+    return d_normed, lax.reduce_precision(normed * g.astype(jnp.float32), fi.nexp, fi.nmant)
+  axes = tuple(range(1, normed.ndim - 1))
+  per_row = jnp.sum(normed * g.astype(jnp.float32), axis=axes) if axes else normed * g.astype(jnp.float32)
+  per_row = lax.reduce_precision(per_row, fi.nexp, fi.nmant)  # [batch, features]: one bf16 rounding per sequence
+  return d_normed, jnp.sum(per_row, axis=0).astype(scale.dtype)
+
+
+_scale_mul_dgamma_per_row.defvjp(_scale_mul_dgamma_per_row_fwd, _scale_mul_dgamma_per_row_bwd)
+
+
 class RMSNorm(nnx.Module):
   """RMS normalization."""
 
@@ -70,9 +113,25 @@ class RMSNorm(nnx.Module):
       parameter_memory_host_offload: bool = False,
       scale_offset: float = 0.0,
       with_scale: bool = True,
+      single_rounding: bool = False,
+      scale_grad_fp32: bool = False,
+      scale_grad_gpu_order: bool = False,
       *,
       rngs: nnx.Rngs,
   ):
+    # single_rounding: compute x * rsqrt(mean(x^2) + eps) * scale entirely in float32 and round to `dtype`
+    # once at the end (as fused GPU RMSNorm kernels do), instead of rounding the normalized value to `dtype`
+    # first and then multiplying by the `dtype` scale (two roundings). The scale is still rounded to `dtype`
+    # before the multiply, matching a GPU model whose parameters are kept in `dtype`.
+    self.single_rounding = single_rounding
+    # scale_grad_fp32 (single_rounding only): round the scale to `dtype` with a straight-through gradient, so the
+    # scale gradient (a sum over all tokens) stays float32 instead of being rounded to `dtype` by the transpose of
+    # reduce_precision. The forward value is unchanged.
+    self.scale_grad_fp32 = scale_grad_fp32
+    # scale_grad_gpu_order (single_rounding only; wins over scale_grad_fp32): the scale gradient is summed over each
+    # batch row (sequence) in float32, rounded once to `dtype`, then summed over rows in float32 -- the order of
+    # TE's fused RMSNorm dgamma + Megatron's float32 main_grad with micro_batch_size 1 per rank. Forward unchanged.
+    self.scale_grad_gpu_order = scale_grad_gpu_order
     self.num_features = num_features
     self.epsilon = epsilon
     self.dtype = dtype
@@ -95,6 +154,28 @@ class RMSNorm(nnx.Module):
     """Applies layer normalization on the input."""
     x = jnp.asarray(x, jnp.float32)
     mean2 = jnp.mean(lax.square(x), axis=-1, keepdims=True)
+    if self.single_rounding and self.with_scale and self.scale_offset == 0.0:
+      normed_fp32 = x * lax.rsqrt(mean2 + self.epsilon)
+      scale = self.scale.get_value()
+      if self.parameter_memory_host_offload:
+        scale = jax.device_put(scale, max_utils.device_space())
+      # Round the scale to `dtype` (as the GPU's `dtype` parameter) with reduce_precision: a convert round trip
+      # may be optimized away under excess precision, reduce_precision never is.
+      if self.scale_grad_gpu_order and self.shard_mode != ShardMode.EXPLICIT:
+        y = _scale_mul_dgamma_per_row(normed_fp32, jnp.asarray(scale, jnp.float32), self.dtype, None)
+        return jnp.asarray(y, self.dtype)
+      if self.scale_grad_fp32:
+        scale_fp32 = max_utils.round_to_dtype_straight_through(jnp.asarray(scale, jnp.float32), self.dtype)
+      else:
+        fi = jnp.finfo(self.dtype)
+        scale_fp32 = lax.reduce_precision(jnp.asarray(scale, jnp.float32), fi.nexp, fi.nmant)
+      if self.shard_mode == ShardMode.EXPLICIT:
+        scale_fp32 = align_scale_with_normalized_axis(scale_fp32, normed_fp32)
+      sharding = truncate_out_sharding(out_sharding, normed_fp32.ndim) if (
+          self.shard_mode == ShardMode.EXPLICIT and out_sharding is not None) else None
+      y = jnp.einsum("...k,k->...k", normed_fp32, scale_fp32, out_sharding=sharding)
+      return jnp.asarray(y, self.dtype)
+
     y = jnp.asarray(x * lax.rsqrt(mean2 + self.epsilon), self.dtype)
 
     # out_sharding must be None in auto shard mode

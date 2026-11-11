@@ -34,6 +34,7 @@ from maxtext.layers import quantizations
 from maxtext.common.common_types import MODEL_MODE_TRAIN
 from maxtext.common.common_types import Config
 from maxtext.layers.nnx_decoders import NNXDecoderLayer
+from maxtext.models import deepseek
 from maxtext.models import models
 from maxtext.trainers.pre_train import train as pre_train
 from maxtext.utils import max_logging
@@ -1189,6 +1190,85 @@ class MTPReuseInputEmbeddingTest(unittest.TestCase):
   def test_reuse_input_embedding(self):
     self.assertEqual(self._check(), (2, 1))
 
+
+class MTPOnMHCModelTest(unittest.TestCase):
+  """The generic MTP layer on an mHC model other than DeepSeek-V4 (e.g. Hy4)."""
+
+  def setUp(self):
+    super().setUp()
+    self.cfg = pyconfig.initialize(
+        [None, get_test_config_path()],
+        model_name="deepseek-custom",
+        run_name="mtp_on_mhc_model_test",
+        skip_jax_distributed_system=True,
+        override_model_config=True,
+        attention="dot_product",
+        mtp_num_layers=1,
+        per_device_batch_size=1,
+        max_target_length=8,
+        max_prefill_predict_length=8,
+        base_emb_dim=16,
+        base_mlp_dim=64,
+        base_moe_mlp_dim=64,
+        num_experts=4,
+        num_experts_per_tok=2,
+        vocab_size=128,
+        engram_layers=[],
+    )
+    self.mesh = Mesh(maxtext_utils.create_device_mesh(self.cfg), self.cfg.mesh_axes)
+    self.rng = jax.random.PRNGKey(0)
+
+  def test_mtp_layer_runs_on_3d_state(self):
+    """MTP runs on the collapsed [batch, seq, emb] state, so its layer must not carry hyper-connections.
+
+    It used to be built from the decoder blueprint with hyper-connections, which expect
+    [batch, seq, mhc_expansion_rate, emb] and failed on the first shape unpack.
+    """
+    self.assertGreater(self.cfg.mhc_expansion_rate, 1)
+    # DeepSeekMoELayer is the blueprint the decoder hands MTP for decoder_block "deepseek" (get_decoder_layers()[-1]).
+    mtp_layer = multi_token_prediction.MultiTokenPredictionLayer(
+        config=self.cfg,
+        mesh=self.mesh,
+        layer_number=1,
+        transformer_layer_module=deepseek.DeepSeekMoELayer,
+        rngs=nnx.Rngs(params=self.rng, dropout=self.rng),
+    )
+    self.assertFalse(mtp_layer.transformer_layer.is_mhc_enabled)
+
+    batch_size, seq_len, embed_dim = int(self.cfg.per_device_batch_size), self.cfg.max_target_length, self.cfg.emb_dim
+    key_h, key_e = jax.random.split(self.rng)
+    prev_hidden_state = jax.random.normal(key_h, (batch_size, seq_len, embed_dim), dtype=self.cfg.dtype)
+    target_token_embedding = jax.random.normal(key_e, (batch_size, seq_len, embed_dim), dtype=self.cfg.dtype)
+    position_ids = jnp.arange(seq_len, dtype=jnp.int32).reshape(1, -1).repeat(batch_size, axis=0)
+    decoder_segment_ids = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
+
+    output = mtp_layer(
+        prev_hidden_state,
+        target_token_embedding,
+        position_ids=position_ids,
+        decoder_segment_ids=decoder_segment_ids,
+        deterministic=True,
+        model_mode=MODEL_MODE_TRAIN,
+    )
+
+    self.assertEqual(output.shape, (batch_size, seq_len, embed_dim))
+    self.assertTrue(jnp.isfinite(output).all())
+
+
+  def test_mhc_mtp_rejects_layer_without_hyper_connection_switch(self):
+    class _LayerWithoutSwitch(nnx.Module):
+
+      def __init__(self, config, mesh, model_mode, rngs):
+        pass
+
+    with self.assertRaises(ValueError):
+      multi_token_prediction.MultiTokenPredictionLayer(
+          config=self.cfg,
+          mesh=self.mesh,
+          layer_number=1,
+          transformer_layer_module=_LayerWithoutSwitch,
+          rngs=nnx.Rngs(params=self.rng, dropout=self.rng),
+      )
 
 if __name__ == "__main__":
   unittest.main()

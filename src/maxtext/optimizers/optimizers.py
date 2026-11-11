@@ -23,8 +23,82 @@ import optax
 from optax.contrib._muon import muon as optax_muon
 from maxtext.common.common_types import DecoderBlockType
 from maxtext.optimizers.muon import muon as maxtext_muon
+from maxtext.optimizers.muon_mcore_compat import muon_compat
 from maxtext.utils.muon_utils import get_muon_weight_dimension_numbers
 from maxtext.utils.maxtext_muon_utils import get_maxtext_muon_weight_dimension_numbers
+
+
+def _key_name(k):
+  for attr in ("key", "name", "idx"):
+    if hasattr(k, attr):
+      return str(getattr(k, attr))
+  return str(k)
+
+
+def _is_mdn_leaf(x):
+  return x is None or isinstance(x, optax.contrib.MuonDimensionNumbers)
+
+
+def _glu_pairs(mdn_tree):
+  """Flat indices (wi_0, wi_1) of gated-MLP pairs that both go to Muon, found by path in `mdn_tree`."""
+  leaves, _ = jax.tree_util.tree_flatten_with_path(mdn_tree, is_leaf=_is_mdn_leaf)
+  index = {tuple(_key_name(k) for k in path): i for i, (path, _) in enumerate(leaves)}
+  pairs = []
+  for path, i in index.items():
+    if "wi_0" in path:
+      j = index.get(tuple("wi_1" if seg == "wi_0" else seg for seg in path))
+      if j is not None and leaves[i][1] is not None and leaves[j][1] is not None:
+        pairs.append((i, j))
+  return pairs
+
+
+def fuse_glu_for_muon(make_opt, mdn_tree) -> optax.GradientTransformation:
+  """Muon on wi_0 and wi_1 concatenated on the output axis (Megatron-Core's fused linear_fc1), as one matrix.
+
+  `make_opt(mdn_tree)` builds the Muon transformation. The wrapper hands it a tree with the same structure as the
+  parameters in which each Muon wi_0 leaf holds concat([wi_0, wi_1], axis=-1) and the paired wi_1 leaf is an empty
+  array (last axis 0) routed to the AdamW branch; momentum for the pair lives on the fused wi_0 leaf. Updates are
+  split back. Weight decay is elementwise, so fusing does not change it; Newton-Schulz and the update scale
+  (consistent_rms / width scaling) see the fused shape. The output axis must be the last axis (-1), which holds for
+  every MaxText gated-MLP kernel: dense and shared [in, (layers), out], routed [experts, (layers), in, out].
+  """
+  pairs = _glu_pairs(mdn_tree)
+  mdn_leaves, mdn_def = jax.tree_util.tree_flatten(mdn_tree, is_leaf=_is_mdn_leaf)
+  for i, j in pairs:
+    if tuple(mdn_leaves[i].output_axis) != (-1,):
+      raise ValueError(f"muon_fuse_glu needs wi_0 output axis (-1,), got {mdn_leaves[i].output_axis}")
+    mdn_leaves[j] = None
+  inner = make_opt(jax.tree_util.tree_unflatten(mdn_def, mdn_leaves))
+
+  def fuse(tree):
+    if tree is None:
+      return None
+    leaves, tdef = jax.tree_util.tree_flatten(tree)
+    leaves = list(leaves)
+    for i, j in pairs:
+      a, b = leaves[i], leaves[j]
+      leaves[i] = jnp.concatenate([a, b], axis=-1)
+      leaves[j] = jnp.zeros(b.shape[:-1] + (0,), b.dtype)
+    return jax.tree_util.tree_unflatten(tdef, leaves)
+
+  def unfuse(fused, like):
+    leaves, tdef = jax.tree_util.tree_flatten(fused)
+    ref = jax.tree_util.tree_leaves(like)
+    leaves = list(leaves)
+    for i, j in pairs:
+      n0 = ref[i].shape[-1]
+      leaves[j] = leaves[i][..., n0:]
+      leaves[i] = leaves[i][..., :n0]
+    return jax.tree_util.tree_unflatten(tdef, leaves)
+
+  def init_fn(params):
+    return inner.init(fuse(params))
+
+  def update_fn(updates, state, params=None):
+    new, state = inner.update(fuse(updates), state, fuse(params))
+    return unfuse(new, updates), state
+
+  return optax.GradientTransformation(init_fn, update_fn)
 
 
 def _get_path_mask_fn(patterns, match_returns_true=True):
@@ -229,9 +303,43 @@ def get_optimizer(config, learning_rate_schedule, model=None, mesh=None):
         muon_weight_dimension_numbers = get_muon_weight_dimension_numbers(model, config)
       else:
         raise ValueError("Please specify model to extract muon dimension number.")
-      muon_kwargs = muon_kwargs | {"muon_weight_dimension_numbers": muon_weight_dimension_numbers}
-      base_opt = optax_muon(**muon_kwargs)  # pyrefly: ignore[bad-argument-type]
+      compat = {
+          "mcore_nesterov": getattr(config, "muon_mcore_nesterov", False),
+          "adam_nesterov": False if getattr(config, "muon_adam_plain", False) else None,
+          "mcore_ns_normalize": getattr(config, "muon_mcore_ns_normalize", False),
+          "mcore_ns_bf16": getattr(config, "muon_mcore_ns_bf16", False),
+          "adam_accurate": getattr(config, "muon_adam_accurate", False),
+      }
+      if (
+          compat["mcore_nesterov"]
+          or compat["adam_nesterov"] is False
+          or compat["mcore_ns_normalize"]
+          or compat["mcore_ns_bf16"]
+          or compat["adam_accurate"]
+      ):
+        # Megatron-Core behaviours (muon_mcore_compat.py); with all three switches off, optax's own muon is used.
+        if jnp.asarray(ns_coeffs).ndim != 1:
+          raise ValueError("muon_mcore_* / muon_adam_plain support one set of Newton-Schulz coefficients only.")
+        make_opt = lambda mdn_tree: muon_compat(**(muon_kwargs | compat | {"muon_weight_dimension_numbers": mdn_tree}))
+      else:
+        make_opt = lambda mdn_tree: optax_muon(  # pyrefly: ignore[bad-argument-type]
+            **(muon_kwargs | {"muon_weight_dimension_numbers": mdn_tree})
+        )
+      if getattr(config, "muon_fuse_glu", False):
+        base_opt = fuse_glu_for_muon(make_opt, muon_weight_dimension_numbers)
+      else:
+        base_opt = make_opt(muon_weight_dimension_numbers)
     elif muon_type in ("maxtext", "maxtext_muon"):
+      for flag in (
+          "muon_fuse_glu",
+          "muon_mcore_nesterov",
+          "muon_adam_plain",
+          "muon_mcore_ns_normalize",
+          "muon_mcore_ns_bf16",
+          "muon_adam_accurate",
+      ):
+        if getattr(config, flag, False):
+          raise ValueError(f"{flag} is only implemented for muon_type=optax_muon.")
       if model is not None:
         muon_weight_dimension_numbers = get_maxtext_muon_weight_dimension_numbers(model, config, mesh=mesh)
       else:
